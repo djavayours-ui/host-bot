@@ -5,6 +5,7 @@ import secrets
 from types import SimpleNamespace
 
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
@@ -12,7 +13,7 @@ import config
 import db
 import util
 from child import B, M, cb_int, show
-from master import AdminCbF, admin_router, answer, ask, can_manage, scr_bot
+from master import AdminCbF, IsAdminF, admin_router, answer, ask, can_manage, scr_bot
 from util import esc
 
 # (kalit, nom, tur, minimal)
@@ -496,3 +497,30 @@ async def run_broadcast(bot, src_chat, src_msg, status):
 AD = {"home": ad_home, "stat": ad_stat, "set": ad_set, "sg": ad_sg, "sv": ad_sv, "pr": ad_pr, "pc": ad_pc, "pt": ad_pt,
       "pd": ad_pd, "pe": ad_pe, "pn": ad_pn, "us": ad_us, "u": ad_u, "ub": ad_ub, "ua": ad_ua, "bots": ad_bots,
       "gr": ad_gr, "bc": ad_bc, "bcgo": ad_bcgo}
+
+
+# ---- zaxira nusxa: /backup (faqat ADMIN_IDS) ----
+def make_backup_bytes():
+    """Ma'lumotlar bazasining izchil nusxasi (WAL rejimida ham xavfsiz)."""
+    import os
+    import sqlite3
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        dst_path = os.path.join(tmp, "backup.db")
+        src = sqlite3.connect(db.path(), timeout=20)
+        dst = sqlite3.connect(dst_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        with open(dst_path, "rb") as f:
+            return f.read()
+
+
+@admin_router.message(Command("backup"), IsAdminF())
+async def h_backup(m: Message, bot):
+    import asyncio
+    data = await asyncio.to_thread(make_backup_bytes)
+    await m.answer_document(BufferedInputFile(data, filename=f"builder-{util.now_local():%Y%m%d-%H%M}.db"),
+                            caption="💾 Zaxira nusxa. Tokenlar ichida — xavfsiz joyda saqlang.")

@@ -25,6 +25,8 @@ VARS_HELP = (
     "<code>%id%</code> — Telegram ID\n"
     "<code>%balance%</code> — foydalanuvchining shu botdagi balansi\n"
     "<code>%users%</code> — botdagi foydalanuvchilar soni\n"
+    "<code>%referrals%</code> — foydalanuvchi taklif qilgan do'stlar soni\n"
+    "<code>%ref_link%</code> — foydalanuvchining shaxsiy taklif havolasi\n"
     "<code>%botname%</code>, <code>%botusername%</code>\n"
     "<code>%channel%</code> — kanal nomi (faqat majburiy obuna tugmalarida)"
 )
@@ -59,7 +61,7 @@ def midnight_ts():
     return n.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
-def make_ctx(cbot, user, balance=0, users=0):
+def make_ctx(cbot, user, balance=0, users=0, refs=0):
     """Xabardagi %o'zgaruvchilar% uchun qiymatlar."""
     n = now_local()
     first = getattr(user, "first_name", "") or ""
@@ -71,6 +73,9 @@ def make_ctx(cbot, user, balance=0, users=0):
         "first_name": first, "last_name": last, "fullname": (first + " " + last).strip(),
         "nickname": f"@{uname}" if uname else first, "username": f"@{uname}" if uname else "",
         "id": getattr(user, "id", 0), "balance": balance, "users": users,
+        "referrals": refs,
+        "ref_link": (f"https://t.me/{cbot['username']}?start=ref_{getattr(user, 'id', 0)}"
+                     if cbot and cbot["username"] else ""),
         "botname": cbot["name"] if cbot else "", "botusername": f"@{cbot['username']}" if cbot and cbot["username"] else "",
     }
 
@@ -140,3 +145,9 @@ def valid_url(u):
 
 def pages(total, per):
     return max(1, -(-total // per))
+
+
+def csv_cell(v):
+    """CSV/Excel formula in'ektsiyasidan himoya: =,+,-,@ bilan boshlangan matn oldiga ' qo'yiladi."""
+    s = "" if v is None else str(v)
+    return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s

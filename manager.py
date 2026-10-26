@@ -11,7 +11,7 @@ from aiogram.exceptions import TelegramConflictError, TelegramRetryAfter, Telegr
 import db
 
 log = logging.getLogger("builder.manager")
-UPDATES = ["message", "callback_query"]
+UPDATES = ["message", "callback_query", "my_chat_member"]
 
 
 class Manager:

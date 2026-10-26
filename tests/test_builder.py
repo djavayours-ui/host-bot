@@ -69,6 +69,92 @@ class TestUtil(unittest.TestCase):
             util.parse_int("99", 1, 20)
 
 
+class TestNewFeatures(Base):
+    def cu(self, uid):
+        db.cuser_touch(100, User(uid, f"User{uid} X", f"u{uid}"))
+
+    def test_migration_adds_columns_to_old_db(self):
+        import sqlite3
+        path = db.path()
+        c = sqlite3.connect(path)
+        c.execute("ALTER TABLE bots RENAME TO bots_new")
+        c.execute("CREATE TABLE bots(id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, token TEXT NOT NULL, "
+                  "username TEXT, name TEXT, active INTEGER NOT NULL DEFAULT 1, created REAL, "
+                  "extra_inline INTEGER NOT NULL DEFAULT 0, extra_reply INTEGER NOT NULL DEFAULT 0, "
+                  "extra_channels INTEGER NOT NULL DEFAULT 0, start_cid INTEGER, sub_cid INTEGER, "
+                  "join_text TEXT NOT NULL DEFAULT 'x', check_text TEXT NOT NULL DEFAULT 'y', "
+                  "join_style TEXT NOT NULL DEFAULT '', check_style TEXT NOT NULL DEFAULT '')")
+        c.execute("DROP TABLE bots_new")
+        c.commit()
+        c.close()
+        db.init()
+        db.init()  # ikkinchi marta xato bermasligi kerak
+        with db.conn() as cn:
+            cols = {r[1] for r in cn.execute("PRAGMA table_info(bots)")}
+        self.assertTrue({"ref_reward", "daily_bonus"} <= cols)
+
+    def test_referral(self):
+        self.mkbot()
+        db.update_bot(100, ref_reward=7)
+        self.cu(10)
+        self.cu(11)
+        self.assertEqual(db.set_referrer(100, 11, 11)[0], "self")
+        self.assertEqual(db.set_referrer(100, 11, 999)[0], "noref")   # taklif qiluvchi botda yo'q
+        self.assertEqual(db.set_referrer(100, 11, 10), ("ok", 7))
+        self.assertEqual(db.set_referrer(100, 11, 10)[0], "already")  # ikkinchi marta hisoblanmaydi
+        self.assertEqual(db.get_cuser(100, 10)["refs"], 1)
+        self.assertEqual(db.get_cuser(100, 10)["balance"], 7)
+        self.assertEqual(db.top_referrers(100)[0]["user_id"], 10)
+        db.set_cban(100, 10, True)
+        self.cu(12)
+        self.assertEqual(db.set_referrer(100, 12, 10)[0], "noref")    # banlangan taklif qila olmaydi
+
+    def test_daily_bonus(self):
+        self.mkbot()
+        self.cu(10)
+        self.assertEqual(db.claim_bonus(100, 10)[0], "off")
+        db.update_bot(100, daily_bonus=5)
+        t = time.time()
+        self.assertEqual(db.claim_bonus(100, 10, t), ("ok", 5))
+        st, left = db.claim_bonus(100, 10, t + 3600)
+        self.assertEqual(st, "wait")
+        self.assertGreater(left, 0)
+        self.assertEqual(db.claim_bonus(100, 10, t + 21 * 3600)[0], "ok")
+        self.assertEqual(db.get_cuser(100, 10)["balance"], 10)
+        self.assertEqual(db.claim_bonus(100, 777)[0], "nouser")
+
+    def test_keywords_and_admins(self):
+        self.mkbot()
+        cid = db.add_content(100, dict(type="text", html="Narx: 10"))
+        kid = db.add_keyword(100, "  Narx ", cid)
+        self.assertIsNone(db.add_keyword(100, "narx", cid))           # takror
+        self.assertEqual(db.keyword_by_word(100, "NARX")["id"], kid)  # katta-kichik farqsiz
+        db.del_keyword(kid)
+        self.assertIsNone(db.get_content(cid))
+        self.assertTrue(db.add_bot_admin(100, 5))
+        self.assertFalse(db.add_bot_admin(100, 5))
+        self.assertTrue(db.is_bot_admin(100, 5))
+        db.del_bot_admin(100, 5)
+        self.assertFalse(db.is_bot_admin(100, 5))
+        db.add_bot_admin(100, 6)
+        db.add_keyword(100, "x", db.add_content(100, dict(type="text", html="y")))
+        db.delete_bot(100)
+        self.assertEqual(db.keywords(100), [])
+        self.assertEqual(db.bot_admins(100), [])
+
+    def test_series_export_and_activity(self):
+        self.mkbot()
+        self.cu(10)
+        s = db.join_series(100, 7)
+        self.assertEqual(len(s), 7)
+        self.assertEqual(s[-1][1], 1)
+        db.set_cactive(100, 10, False)
+        self.assertEqual(db.cstats(100)["active"], 0)
+        self.assertEqual(len(db.cusers_export(100)), 1)
+        self.assertEqual(util.csv_cell("=1+1"), "'=1+1")
+        self.assertEqual(util.csv_cell("Ali"), "Ali")
+
+
 class TestDb(Base):
     def test_default_limits(self):
         b = self.mkbot()

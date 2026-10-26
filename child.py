@@ -1,15 +1,19 @@
 """Yaratilgan botlar: foydalanuvchi qismi (start, tugmalar, majburiy obuna) va bot ichidagi admin panel (/admin)."""
 import asyncio
+import csv
+import io
 import logging
 import re
+import time
+from collections import deque
 from types import SimpleNamespace
 
 from aiogram import BaseMiddleware, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.filters import Command, CommandStart, Filter
+from aiogram.filters import Command, CommandObject, CommandStart, Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import config
 import content as ct
@@ -19,7 +23,9 @@ from storage import SqliteStorage
 from util import esc
 
 log = logging.getLogger("builder.child")
-RESERVED = {"start", "admin", "cancel"}
+RESERVED = {"start", "admin", "cancel", "balance", "bonus", "ref"}
+MAX_KEYWORDS = 50
+BUILTIN = {"balance", "bonus", "ref"}
 
 
 # ============================== umumiy yordamchilar ==============================
@@ -59,7 +65,8 @@ async def show(obj, text, kb=None):
 
 def ctx_of(cbot, user):
     cu = db.get_cuser(cbot["id"], user.id)
-    return util.make_ctx(cbot, user, cu["balance"] if cu else 0, db.count_cusers(cbot["id"]))
+    return util.make_ctx(cbot, user, cu["balance"] if cu else 0, db.count_cusers(cbot["id"]),
+                         cu["refs"] if cu else 0)
 
 
 def style_icon(s):
@@ -72,8 +79,29 @@ admin_r = Router()
 user_r = Router()
 
 
+_HITS = {}                      # (bot_id, user_id) -> oxirgi so'rovlar vaqti
+FLOOD_N, FLOOD_SEC = 20, 10     # 10 soniyada 20 tadan ko'p so'rov — e'tiborsiz qoldiriladi
+
+
+def flooding(key, now=None):
+    """True — foydalanuvchi juda tez-tez yozmoqda (adminlarga qo'llanmaydi)."""
+    now = now or time.monotonic()
+    q = _HITS.get(key)
+    if q is None:
+        if len(_HITS) > 50000:
+            _HITS.clear()
+        q = _HITS[key] = deque()
+    while q and now - q[0] > FLOOD_SEC:
+        q.popleft()
+    if len(q) >= FLOOD_N:
+        return True
+    q.append(now)
+    return False
+
+
 class CtxMw(BaseMiddleware):
-    """Bot yozuvini topadi, foydalanuvchini ro'yxatga oladi, adminlikni aniqlaydi (egasi yoki asosiy admin)."""
+    """Bot yozuvini topadi, foydalanuvchini ro'yxatga oladi, adminlikni aniqlaydi
+    (egasi, asosiy admin yoki egasi qo'shgan admin). Botni bloklash/blokdan chiqarishni kuzatadi."""
 
     async def __call__(self, handler, event, data):
         bot = data["bot"]
@@ -81,11 +109,24 @@ class CtxMw(BaseMiddleware):
         if not row or not row["active"]:
             return None
         data["cbot"] = row
+        mcm = getattr(event, "my_chat_member", None)
+        if mcm is not None:  # foydalanuvchi botni blokladi / blokdan chiqardi
+            if mcm.chat.type == "private":
+                st = getattr(mcm.new_chat_member.status, "value", mcm.new_chat_member.status)
+                if st in ("kicked", "left"):
+                    db.set_cactive(row["id"], mcm.from_user.id, False)
+                elif st == "member":
+                    db.set_cactive(row["id"], mcm.from_user.id, True)
+            return None
         user = data.get("event_from_user")
         data["admin"] = False
+        data["is_new"] = False
         if user and not user.is_bot:
-            data["admin"] = user.id == row["owner_id"] or user.id in config.ADMIN_IDS
-            cu = db.cuser_touch(row["id"], user)
+            data["admin"] = (user.id == row["owner_id"] or user.id in config.ADMIN_IDS
+                             or db.is_bot_admin(row["id"], user.id))
+            if not data["admin"] and flooding((row["id"], user.id)):
+                return None
+            cu, data["is_new"] = db.cuser_touch_new(row["id"], user)
             if cu["banned"] and not data["admin"]:
                 return None
         return await handler(event, data)
@@ -98,7 +139,7 @@ class IsAdmin(Filter):
 
 PREFIXES = {"a", "x", "ce", "cw", "cp", "ia", "ik", "it", "is", "lay", "il", "ib", "ibt", "ibc", "ibs", "ibv", "ibd",
             "rbl", "rb", "rb+", "rbn", "rbc", "rbs", "rbd", "rbdo", "cml", "cm", "cm+", "cmd", "cmdo", "ch", "ch+",
-            "chl", "chu", "chd", "sj", "sc", "sst", "bcgo"}
+            "chl", "chu", "chd", "sj", "sc", "sst", "bcgo", "bcx", "kwl", "kw", "kw+", "kwd", "kwdo", "adm", "adm+", "admd"}
 KEEP_STATE = {"it", "is", "lay"}
 
 
@@ -173,13 +214,58 @@ async def send_start(bot, cbot, user, chat_id):
         await ct.send_content(bot, chat_id, c, ctx, rm)
 
 
+async def apply_referral(bot, cbot, user, arg):
+    """/start ref_<id> orqali kelgan yangi foydalanuvchi uchun taklif qiluvchiga mukofot beradi."""
+    if not arg.startswith("ref_") or not arg[4:].isdigit():
+        return
+    ref_id = int(arg[4:])
+    st, reward = db.set_referrer(cbot["id"], user.id, ref_id)
+    if st != "ok":
+        return
+    sym = f" (+{reward})" if reward else ""
+    try:
+        await bot.send_message(ref_id, f"🎉 <b>{esc(user.full_name)}</b> sizning havolangiz orqali qo'shildi{sym}")
+    except Exception:
+        pass
+
+
 @user_r.message(CommandStart())
-async def h_start(m: Message, bot, cbot, admin):
+async def h_start(m: Message, bot, cbot, admin, command: CommandObject, is_new: bool = False):
+    if is_new and command.args:
+        await apply_referral(bot, cbot, m.from_user, command.args.strip())
     if not admin and not await passes_gate(bot, cbot, m.from_user, m.chat.id):
         return
     await send_start(bot, cbot, m.from_user, m.chat.id)
     if m.from_user.id == cbot["owner_id"]:
         await m.answer("🛠 Botni sozlash paneli: /admin")
+
+
+def fmt_wait(sec):
+    h, mi = sec // 3600, (sec % 3600) // 60
+    return f"{h} soat {mi} daqiqa" if h else f"{max(mi, 1)} daqiqa"
+
+
+async def builtin(m: Message, cbot, name):
+    """/balance, /bonus, /ref — har bir botda tayyor ishlaydigan buyruqlar."""
+    cbot = db.get_bot(cbot["id"]) or cbot
+    uid = m.from_user.id
+    if name == "balance":
+        cu = db.get_cuser(cbot["id"], uid)
+        return await m.answer(f"💰 Balansingiz: <b>{cu['balance'] if cu else 0}</b>")
+    if name == "bonus":
+        st, v = db.claim_bonus(cbot["id"], uid)
+        if st == "ok":
+            cu = db.get_cuser(cbot["id"], uid)
+            return await m.answer(f"🎁 Kunlik bonus: <b>+{v}</b>\n💰 Balansingiz: <b>{cu['balance']}</b>")
+        if st == "wait":
+            return await m.answer(f"⏳ Keyingi bonusgacha: <b>{fmt_wait(v)}</b>")
+        return await m.answer("ℹ️ Kunlik bonus hozir yoqilmagan.")
+    if name == "ref":
+        cu = db.get_cuser(cbot["id"], uid)
+        link = f"https://t.me/{cbot['username']}?start=ref_{uid}"
+        reward = f"\nHar bir taklif uchun: <b>+{cbot['ref_reward']}</b>" if cbot["ref_reward"] else ""
+        return await m.answer(f"👥 <b>Do'stlarni taklif qiling</b>\nSizning havolangiz:\n<code>{link}</code>\n"
+                              f"Taklif qilinganlar: <b>{cu['refs'] if cu else 0}</b>{reward}")
 
 
 @user_r.message(F.text)
@@ -188,8 +274,12 @@ async def h_text(m: Message, bot, cbot, admin):
     if t.startswith("/"):
         name = t[1:].split()[0].split("@")[0].lower() if len(t) > 1 else ""
         row = db.command_by_name(cbot["id"], name)
+        if not row and name in BUILTIN:  # o'z buyrug'i bo'lmasa — tayyor buyruq
+            if not admin and not await passes_gate(bot, cbot, m.from_user, m.chat.id):
+                return
+            return await builtin(m, cbot, name)
     else:
-        row = db.rbutton_by_text(cbot["id"], m.text)
+        row = db.rbutton_by_text(cbot["id"], m.text) or db.keyword_by_word(cbot["id"], t)
     if not row:
         return
     if not admin and not await passes_gate(bot, cbot, m.from_user, m.chat.id):
@@ -253,16 +343,73 @@ def scr_home(cbot):
         [B("📝 Start xabari", f"ce:{cbot['start_cid']}"), B("⌨️ Pastki tugmalar", "rbl")],
         [B("💬 Buyruqlar", "cml"), B("📢 Majburiy obuna", "a:sub")],
         [B("📣 Xabar yuborish", "a:bc"), B("📊 Statistika", "a:stat")],
+        [B("🔑 Kalit so'zlar", "kwl"), B("🎁 Referal va bonus", "a:eco")],
         [B("💰 Balans", "a:bal"), B("🚫 Ban / Unban", "a:ban")],
+        [B("📥 Foydalanuvchilar (CSV)", "a:exp"), B("👮 Adminlar", "a:adm")],
         [B("🔤 O'zgaruvchilar", "a:vars"), B("🛒 Do'kon / limitlar", "a:shop")],
     )
 
 
+def bar(n, top, width=10):
+    return "▇" * (max(1, round(n / top * width)) if n and top else 0)
+
+
 def scr_stat(cbot):
     s = db.cstats(cbot["id"])
+    series = db.join_series(cbot["id"], 7)
+    top = max([n for _d, n in series] or [0])
+    chart = "\n".join(f"<code>{d}</code> {bar(n, top)} {n}" for d, n in series)
+    refs = db.top_referrers(cbot["id"], 5)
+    ref_txt = ""
+    if refs:
+        ref_txt = "\n\n🏆 <b>Eng ko'p taklif qilganlar</b>\n" + "\n".join(
+            f"{i}. {esc(r['name'] or r['user_id'])} — {r['refs']}" for i, r in enumerate(refs, 1))
     return (f"📊 <b>Statistika</b>\n👥 Jami: <b>{s['total']}</b>\n✅ Faol (bloklamagan): {s['active']}\n"
-            f"🆕 Bugun: {s['today']} · 7 kun: {s['week']}\n🕒 24 soatda faol: {s['online']}\n🚫 Ban: {s['banned']}",
+            f"🆕 Bugun: {s['today']} · 7 kun: {s['week']}\n🕒 24 soatda faol: {s['online']}\n🚫 Ban: {s['banned']}\n\n"
+            f"📈 <b>Oxirgi 7 kun (yangi foydalanuvchilar)</b>\n{chart}{ref_txt}",
             M([B("⬅️ Orqaga", "a:home")]))
+
+
+def scr_eco(cbot):
+    cbot = db.get_bot(cbot["id"])
+    off = " (o'chirilgan)"
+    return (f"🎁 <b>Referal va kunlik bonus</b>\n\n"
+            f"👥 Taklif uchun mukofot: <b>{cbot['ref_reward']}</b>{off if not cbot['ref_reward'] else ''}\n"
+            f"🎁 Kunlik bonus: <b>{cbot['daily_bonus']}</b>{off if not cbot['daily_bonus'] else ''}\n\n"
+            "Foydalanuvchilar uchun tayyor buyruqlar: <code>/ref</code> — taklif havolasi, <code>/bonus</code> — kunlik bonus, "
+            "<code>/balance</code> — balans. Xabar matnida <code>%ref_link%</code> va <code>%referrals%</code> ishlaydi.\n"
+            "Mukofot 0 bo'lsa — o'chirilgan (referal hisoblanadi, lekin balans berilmaydi).",
+            M([B("✏️ Taklif mukofoti", "a:refr"), B("✏️ Kunlik bonus", "a:dbon")],
+              [B("⬅️ Orqaga", "a:home")]))
+
+
+def is_owner_level(cbot, uid):
+    return uid == cbot["owner_id"] or uid in config.ADMIN_IDS
+
+
+def scr_adm(cbot):
+    ids = db.bot_admins(cbot["id"])
+    rows = [[B(f"🗑 {uid}", f"adm:{uid}")] for uid in ids]
+    rows += [[B("➕ Admin qo'shish", "adm+")], [B("⬅️ Orqaga", "a:home")]]
+    return (f"👮 <b>Adminlar</b> ({len(ids)})\nQo'shilgan adminlar shu botni sozlay oladi (/admin), "
+            "lekin boshqa adminlarni boshqara olmaydi.\nO'chirish uchun ID ustiga bosing.", M(*rows))
+
+
+def scr_kwl(cbot):
+    kws = db.keywords(cbot["id"])
+    rows = [[B(f"🔑 {k['word']}"[:40], f"kw:{k['id']}")] for k in kws]
+    rows += [[B("➕ Kalit so'z qo'shish", "kw+")], [B("⬅️ Orqaga", "a:home")]]
+    return (f"🔑 <b>Kalit so'zlar</b> ({len(kws)}/{MAX_KEYWORDS})\nFoydalanuvchi aynan shu matnni yozsa "
+            "(katta-kichik harf farqsiz), bot tayyor xabar bilan javob beradi. Har biriga xabar va inline tugmalar "
+            "biriktiriladi."), M(*rows)
+
+
+def scr_kw(kid):
+    k = db.get_keyword(kid)
+    return (f"🔑 <b>{esc(k['word'])}</b>\n🔘 Inline tugmalar: {db.count_ibuttons(k['content_id'])}"), M(
+        [B("📝 Xabar va inline tugmalar", f"ce:{k['content_id']}")],
+        [B("🗑 O'chirish", f"kwd:{kid}")],
+        [B("⬅️ Orqaga", "kwl")])
 
 
 def scr_shop(cbot):
@@ -289,6 +436,9 @@ def content_owner_back(cbot, cid):
         r = c.execute("SELECT id FROM commands WHERE content_id=?", (cid,)).fetchone()
         if r:
             return f"cm:{r[0]}"
+        r = c.execute("SELECT id FROM keywords WHERE content_id=?", (cid,)).fetchone()
+        if r:
+            return f"kw:{r[0]}"
     return "a:home"
 
 
@@ -494,6 +644,20 @@ async def r_a(x):
                           M([B("⬅️ Orqaga", "a:home")]))
     if sub == "sub":
         return await show(x.c, *scr_sub(x.cbot))
+    if sub == "eco":
+        return await show(x.c, *scr_eco(x.cbot))
+    if sub == "refr":
+        return await ask(x.c, x.state, "eco_ref", "👥 Har bir taklif qilingan do'st uchun mukofotni yuboring "
+                                                  "(0 — mukofotsiz, maks. 1 000 000):", "a:eco")
+    if sub == "dbon":
+        return await ask(x.c, x.state, "eco_bonus", "🎁 Kunlik bonus miqdorini yuboring "
+                                                    "(0 — o'chirish, maks. 1 000 000):", "a:eco")
+    if sub == "adm":
+        if not is_owner_level(x.cbot, x.user.id):
+            return await x.c.answer("Adminlarni faqat bot egasi boshqaradi", show_alert=True)
+        return await show(x.c, *scr_adm(x.cbot))
+    if sub == "exp":
+        return await export_users(x)
     if sub == "bc":
         if x.cbot["id"] in BCAST:
             return await x.c.answer("Xabar yuborish davom etmoqda", show_alert=True)
@@ -1067,7 +1231,9 @@ async def r_sst(x):
 
 # ---- xabar yuborish ----
 BCAST = set()
+BCANCEL = set()
 _TASKS = set()
+STOP_KB = M([B("⛔ To'xtatish", "bcx")])
 
 
 @answer("bc_msg")
@@ -1087,8 +1253,9 @@ async def r_bcgo(x):
         return await x.c.answer("Allaqachon yuborilmoqda", show_alert=True)
     await x.state.clear()
     await x.c.answer("Boshlandi")
-    status = await x.c.message.edit_text("⏳ Yuborilmoqda...")
+    status = await x.c.message.edit_text("⏳ Yuborilmoqda...", reply_markup=STOP_KB)
     BCAST.add(x.cbot["id"])
+    BCANCEL.discard(x.cbot["id"])
     t = asyncio.create_task(run_broadcast(x.bot, x.cbot["id"], d["src_chat"], d["src_msg"], status))
     _TASKS.add(t)
     t.add_done_callback(_TASKS.discard)
@@ -1097,8 +1264,12 @@ async def r_bcgo(x):
 async def run_broadcast(bot, bot_id, src_chat, src_msg, status):
     ids = db.cuser_ids(bot_id)
     ok = bad = 0
+    stopped = False
     try:
         for i, uid in enumerate(ids, 1):
+            if bot_id in BCANCEL:
+                stopped = True
+                break
             for attempt in (1, 2):
                 try:
                     await bot.copy_message(uid, src_chat, src_msg)
@@ -1116,13 +1287,15 @@ async def run_broadcast(bot, bot_id, src_chat, src_msg, status):
                 await asyncio.sleep(1)
             if i % 100 == 0:
                 try:
-                    await status.edit_text(f"⏳ Yuborilmoqda... {i}/{len(ids)}")
+                    await status.edit_text(f"⏳ Yuborilmoqda... {i}/{len(ids)}", reply_markup=STOP_KB)
                 except Exception:
                     pass
     finally:
         BCAST.discard(bot_id)
+        BCANCEL.discard(bot_id)
         try:
-            await status.edit_text(f"✅ Yuborish tugadi.\n📨 Yetkazildi: <b>{ok}</b>\n🚫 Yetmadi (bloklagan va h.k.): {bad}")
+            head = "⛔ To'xtatildi." if stopped else "✅ Yuborish tugadi."
+            await status.edit_text(f"{head}\n📨 Yetkazildi: <b>{ok}</b>\n🚫 Yetmadi (bloklagan va h.k.): {bad}")
         except Exception:
             pass
 
@@ -1167,7 +1340,7 @@ async def a_ban_id(m, state, d, bot, cbot):
     u = db.get_cuser(cbot["id"], uid)
     if not u:
         return await m.answer("❌ Bu foydalanuvchi shu botga hali /start bosmagan.")
-    if uid == cbot["owner_id"] or uid in config.ADMIN_IDS:
+    if uid == cbot["owner_id"] or uid in config.ADMIN_IDS or db.is_bot_admin(cbot["id"], uid):
         return await m.answer("❌ Adminni ban qilib bo'lmaydi.")
     flag = not u["banned"]
     db.set_cban(cbot["id"], uid, flag)
@@ -1176,11 +1349,176 @@ async def a_ban_id(m, state, d, bot, cbot):
     await m.answer(("🚫 Ban qilindi: " if flag else "✅ Bandan chiqarildi: ") + f"<code>{uid}</code>\n\n" + text, reply_markup=kb)
 
 
+# ---- referal va bonus ----
+@answer("eco_ref")
+async def a_eco_ref(m, state, d, bot, cbot):
+    try:
+        v = util.parse_int(m.text, 0, 1_000_000)
+    except ValueError:
+        return await m.answer("❌ 0 dan 1 000 000 gacha butun son yuboring.")
+    db.update_bot(cbot["id"], ref_reward=v)
+    await state.clear()
+    text, kb = scr_eco(cbot)
+    await m.answer("✅ Saqlandi.\n\n" + text, reply_markup=kb)
+
+
+@answer("eco_bonus")
+async def a_eco_bonus(m, state, d, bot, cbot):
+    try:
+        v = util.parse_int(m.text, 0, 1_000_000)
+    except ValueError:
+        return await m.answer("❌ 0 dan 1 000 000 gacha butun son yuboring.")
+    db.update_bot(cbot["id"], daily_bonus=v)
+    await state.clear()
+    text, kb = scr_eco(cbot)
+    await m.answer("✅ Saqlandi.\n\n" + text, reply_markup=kb)
+
+
+# ---- foydalanuvchilar eksporti ----
+async def export_users(x):
+    rows = db.cusers_export(x.cbot["id"])
+    if not rows:
+        return await x.c.answer("Hali foydalanuvchi yo'q", show_alert=True)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "ism", "username", "balans", "takliflar", "taklif_qilgan", "ban", "faol", "qo'shilgan", "oxirgi_faollik"])
+    for r in rows:
+        w.writerow([r["user_id"], util.csv_cell(r["name"]), util.csv_cell(r["username"]), r["balance"], r["refs"],
+                    r["referrer_id"] or "", r["banned"], r["active"], util.fmt_dt(r["joined"]), util.fmt_dt(r["last_seen"])])
+    data = ("\ufeff" + buf.getvalue()).encode("utf-8")  # BOM: Excel'da o'zbekcha harflar to'g'ri ochiladi
+    await x.c.answer()
+    await x.bot.send_document(x.c.message.chat.id, BufferedInputFile(data, filename=f"users_{x.cbot['id']}.csv"),
+                              caption=f"📥 Foydalanuvchilar: {len(rows)} ta")
+
+
+# ---- adminlar (faqat egasi) ----
+async def r_adm(x):
+    if not is_owner_level(x.cbot, x.user.id):
+        return await x.c.answer("Faqat bot egasi", show_alert=True)
+    uid = cb_int(x.c.data, 1)
+    if uid in db.bot_admins(x.cbot["id"]):
+        await show(x.c, f"🗑 <code>{uid}</code> adminlikdan olinsinmi?",
+                   M([B("✅ Ha", f"admd:{uid}"), B("⬅️ Yo'q", "a:adm")]))
+
+
+async def r_adm_add(x):
+    if not is_owner_level(x.cbot, x.user.id):
+        return await x.c.answer("Faqat bot egasi", show_alert=True)
+    await ask(x.c, x.state, "adm_add", "👮 Yangi admin ID raqamini yuboring (u shu botga /start bosgan bo'lishi kerak):", "a:adm")
+
+
+@answer("adm_add")
+async def a_adm_add(m, state, d, bot, cbot):
+    if not is_owner_level(cbot, m.from_user.id):
+        return await state.clear()
+    try:
+        uid = util.parse_int(m.text, 1)
+    except ValueError:
+        return await m.answer("❌ ID raqam yuboring.")
+    if not db.get_cuser(cbot["id"], uid):
+        return await m.answer("❌ Bu foydalanuvchi shu botga hali /start bosmagan.")
+    if is_owner_level(cbot, uid):
+        return await m.answer("ℹ️ Bu foydalanuvchi allaqachon admin.")
+    if len(db.bot_admins(cbot["id"])) >= 10:
+        return await m.answer("❌ Maksimal 10 ta qo'shimcha admin.")
+    ok = db.add_bot_admin(cbot["id"], uid)
+    await state.clear()
+    text, kb = scr_adm(cbot)
+    await m.answer(("✅ Admin qo'shildi.\n\n" if ok else "ℹ️ Bu admin allaqachon qo'shilgan.\n\n") + text, reply_markup=kb)
+
+
+async def r_admd(x):
+    if not is_owner_level(x.cbot, x.user.id):
+        return await x.c.answer("Faqat bot egasi", show_alert=True)
+    db.del_bot_admin(x.cbot["id"], cb_int(x.c.data, 1))
+    await x.c.answer("Olib tashlandi")
+    await show(x.c, *scr_adm(x.cbot))
+
+
+# ---- kalit so'zlar ----
+async def r_kwl(x):
+    await show(x.c, *scr_kwl(x.cbot))
+
+
+def own_kw(x, kid):
+    k = db.get_keyword(kid)
+    return k if k and k["bot_id"] == x.cbot["id"] else None
+
+
+async def r_kw(x):
+    kid = cb_int(x.c.data, 1)
+    if own_kw(x, kid):
+        await show(x.c, *scr_kw(kid))
+
+
+async def r_kw_add(x):
+    n = len(db.keywords(x.cbot["id"]))
+    if n >= MAX_KEYWORDS:
+        return await x.c.answer(f"Maksimal {MAX_KEYWORDS} ta kalit so'z", show_alert=True)
+    await ask(x.c, x.state, "kw_word", "🔑 Kalit so'zni yuboring (1–64 belgi, «/» bilan boshlanmasin). "
+                                       "Foydalanuvchi aynan shuni yozsa bot javob beradi:", "kwl")
+
+
+@answer("kw_word")
+async def a_kw_word(m, state, d, bot, cbot):
+    t = (m.text or "").strip()
+    if not 1 <= len(t) <= 64 or t.startswith("/"):
+        return await m.answer("❌ 1–64 belgi bo'lsin va «/» bilan boshlanmasin.")
+    if db.keyword_by_word(cbot["id"], t):
+        return await m.answer("❌ Bunday kalit so'z allaqachon bor.")
+    if db.rbutton_by_text(cbot["id"], t):
+        return await m.answer("❌ Bu matn pastki tugma nomi bilan bir xil — pastki tugma ustun turadi. Boshqa so'z yuboring.")
+    await ask(m, state, "kw_msg", f"📝 «{esc(t)}» yozilganda chiqadigan xabarni yuboring (har qanday turda).", "kwl", word=t)
+
+
+@answer("kw_msg")
+async def a_kw_msg(m, state, d, bot, cbot):
+    new = ct.extract(m)
+    if not new:
+        return await m.answer("❌ Bu turdagi xabar qo'llab-quvvatlanmaydi.")
+    if len(db.keywords(cbot["id"])) >= MAX_KEYWORDS:
+        await state.clear()
+        return await m.answer(f"❌ Maksimal {MAX_KEYWORDS} ta kalit so'z.")
+    cid = db.add_content(cbot["id"], new)
+    kid = db.add_keyword(cbot["id"], d["word"], cid)
+    if not kid:
+        db.delete_content(cid)
+        return await m.answer("❌ Bunday kalit so'z allaqachon bor.")
+    await state.clear()
+    text, kb = scr_kw(kid)
+    await m.answer("✅ Kalit so'z qo'shildi.\n\n" + text, reply_markup=kb)
+
+
+async def r_kwd(x):
+    kid = cb_int(x.c.data, 1)
+    if own_kw(x, kid):
+        await show(x.c, "🗑 Kalit so'z va uning xabari o'chiriladi. Davom etamizmi?",
+                   M([B("✅ Ha", f"kwdo:{kid}"), B("⬅️ Yo'q", f"kw:{kid}")]))
+
+
+async def r_kwdo(x):
+    kid = cb_int(x.c.data, 1)
+    if own_kw(x, kid):
+        db.del_keyword(kid)
+        await x.c.answer("O'chirildi")
+        await show(x.c, *scr_kwl(x.cbot))
+
+
+# ---- xabar yuborishni to'xtatish ----
+async def r_bcx(x):
+    if x.cbot["id"] in BCAST:
+        BCANCEL.add(x.cbot["id"])
+        await x.c.answer("To'xtatilmoqda...")
+    else:
+        await x.c.answer("Yuborish faol emas")
+
+
 ROUTES = {
     "x": r_x, "a": r_a, "ce": r_ce, "cw": r_cw, "cp": r_cp, "ia": r_ia, "ik": r_ik, "it": r_it, "is": r_is,
     "lay": r_lay, "il": r_il, "ib": r_ib, "ibt": r_ibt, "ibc": r_ibc, "ibs": r_ibs, "ibv": r_ibv, "ibd": r_ibd,
     "rbl": r_rbl, "rb": r_rb, "rb+": r_rb_add, "rbn": r_rbn, "rbc": r_rbc, "rbs": r_rbs, "rbd": r_rbd, "rbdo": r_rbdo,
     "cml": r_cml, "cm": r_cm, "cm+": r_cm_add, "cmd": r_cmd, "cmdo": r_cmdo,
     "ch": r_ch, "ch+": r_ch_add, "chl": r_chl, "chu": r_chu, "chd": r_chd, "sj": r_sj, "sc": r_sc, "sst": r_sst,
-    "bcgo": r_bcgo,
+    "bcgo": r_bcgo, "bcx": r_bcx, "kwl": r_kwl, "kw": r_kw, "kw+": r_kw_add, "kwd": r_kwd, "kwdo": r_kwdo,
+    "adm": r_adm, "adm+": r_adm_add, "admd": r_admd,
 }

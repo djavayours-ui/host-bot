@@ -81,13 +81,36 @@ CREATE TABLE IF NOT EXISTS payments(charge_id TEXT PRIMARY KEY, user_id INTEGER 
 CREATE TABLE IF NOT EXISTS purchases(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
     bot_id INTEGER NOT NULL, item TEXT NOT NULL, qty INTEGER NOT NULL, cost INTEGER NOT NULL, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS fsm(key TEXT PRIMARY KEY, state TEXT, data TEXT NOT NULL DEFAULT '{}', updated REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS keywords(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER NOT NULL, word TEXT NOT NULL, content_id INTEGER NOT NULL,
+    UNIQUE(bot_id, word));
+CREATE INDEX IF NOT EXISTS kw_bot ON keywords(bot_id);
+CREATE TABLE IF NOT EXISTS bot_admins(bot_id INTEGER NOT NULL, user_id INTEGER NOT NULL, added REAL,
+    PRIMARY KEY(bot_id, user_id));
 """
+
+# Mavjud bazalarga qo'shiladigan ustunlar: (jadval, ustun, ta'rif)
+MIGRATIONS = [
+    ("bots", "ref_reward", "INTEGER NOT NULL DEFAULT 0"),
+    ("bots", "daily_bonus", "INTEGER NOT NULL DEFAULT 0"),
+    ("cusers", "referrer_id", "INTEGER"),
+    ("cusers", "refs", "INTEGER NOT NULL DEFAULT 0"),
+    ("cusers", "last_bonus", "REAL NOT NULL DEFAULT 0"),
+]
+
+
+def _migrate(c):
+    for table, col, ddl in MIGRATIONS:
+        have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+        if col not in have:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
 
 
 def init():
     with conn() as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(SCHEMA)
+        _migrate(c)
         c.execute("DELETE FROM fsm WHERE updated < ?", (time.time() - 7 * 86400,))
     _CACHE.clear()
 
@@ -291,7 +314,7 @@ def count_bots(owner=None):
 
 
 _BOT_FIELDS = {"token", "username", "name", "active", "extra_inline", "extra_reply", "extra_channels", "start_cid",
-               "sub_cid", "join_text", "check_text", "join_style", "check_style"}
+               "sub_cid", "join_text", "check_text", "join_style", "check_style", "ref_reward", "daily_bonus"}
 
 
 def update_bot(bid, **f):
@@ -307,9 +330,10 @@ def delete_bot(bid):
         cids = [r[0] for r in c.execute("SELECT id FROM contents WHERE bot_id=?", (bid,))]
         for cid in cids:
             c.execute("DELETE FROM ibuttons WHERE content_id=?", (cid,))
-        for t in ("contents", "rbuttons", "commands", "channels", "cusers"):
+        for t in ("contents", "rbuttons", "commands", "channels", "cusers", "keywords", "bot_admins"):
             c.execute(f"DELETE FROM {t} WHERE bot_id=?", (bid,))
         c.execute("DELETE FROM bots WHERE id=?", (bid,))
+        c.execute("DELETE FROM fsm WHERE key LIKE ?", (f"{bid}:%",))
 
 
 def create_bot_with_defaults(bid, owner, token, username, name):
@@ -507,6 +531,12 @@ def cuser_touch(bot_id, u):
         return c.execute("SELECT * FROM cusers WHERE bot_id=? AND user_id=?", (bot_id, u.id)).fetchone()
 
 
+def cuser_touch_new(bot_id, u):
+    """(qator, yangi_mi). Yangi foydalanuvchi — shu botda birinchi marta ko'rilgan."""
+    existed = get_cuser(bot_id, u.id) is not None
+    return cuser_touch(bot_id, u), not existed
+
+
 def get_cuser(bot_id, uid):
     with conn() as c:
         return c.execute("SELECT * FROM cusers WHERE bot_id=? AND user_id=?", (bot_id, uid)).fetchone()
@@ -632,3 +662,135 @@ def promo_redeem(code, uid, now=None):
         c.execute("UPDATE promos SET used=used+1 WHERE code=?", (code,))
         c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (p["reward"], uid))
         return "ok", p["reward"]
+
+
+# ----------------------------- referal va kunlik bonus -----------------------------
+def set_referrer(bot_id, uid, referrer_id):
+    """Yangi foydalanuvchiga taklif qilgan odamni biriktiradi va unga mukofot beradi.
+    Faqat bir marta, o'zini o'zi taklif qila olmaydi, taklif qiluvchi shu botda bo'lishi shart.
+    (holat, mukofot): ok | self | exists | noref | already"""
+    if uid == referrer_id:
+        return "self", 0
+    with conn(tx=True) as c:
+        me = c.execute("SELECT referrer_id FROM cusers WHERE bot_id=? AND user_id=?", (bot_id, uid)).fetchone()
+        if not me:
+            return "noref", 0
+        if me["referrer_id"] is not None:
+            return "already", 0
+        ref = c.execute("SELECT banned FROM cusers WHERE bot_id=? AND user_id=?", (bot_id, referrer_id)).fetchone()
+        if not ref or ref["banned"]:
+            return "noref", 0
+        reward = c.execute("SELECT ref_reward FROM bots WHERE id=?", (bot_id,)).fetchone()["ref_reward"]
+        c.execute("UPDATE cusers SET referrer_id=? WHERE bot_id=? AND user_id=?", (referrer_id, bot_id, uid))
+        c.execute("UPDATE cusers SET refs=refs+1, balance=balance+? WHERE bot_id=? AND user_id=?",
+                  (reward, bot_id, referrer_id))
+        return "ok", reward
+
+
+def top_referrers(bot_id, limit=10):
+    with conn() as c:
+        return c.execute("SELECT user_id,name,username,refs FROM cusers WHERE bot_id=? AND refs>0 "
+                         "ORDER BY refs DESC, user_id LIMIT ?", (bot_id, limit)).fetchall()
+
+
+BONUS_COOLDOWN = 20 * 3600  # soat: ketma-ket ikki marta olishni oldini oladi, lekin kuniga 1 marta qulay
+
+
+def claim_bonus(bot_id, uid, now=None):
+    """(holat, summa | qolgan_soniya). holat: ok | off | wait | nouser"""
+    now = now or time.time()
+    with conn(tx=True) as c:
+        b = c.execute("SELECT daily_bonus FROM bots WHERE id=?", (bot_id,)).fetchone()
+        if not b or b["daily_bonus"] <= 0:
+            return "off", 0
+        u = c.execute("SELECT last_bonus FROM cusers WHERE bot_id=? AND user_id=?", (bot_id, uid)).fetchone()
+        if not u:
+            return "nouser", 0
+        left = u["last_bonus"] + BONUS_COOLDOWN - now
+        if left > 0:
+            return "wait", int(left)
+        c.execute("UPDATE cusers SET balance=balance+?, last_bonus=? WHERE bot_id=? AND user_id=?",
+                  (b["daily_bonus"], now, bot_id, uid))
+        return "ok", b["daily_bonus"]
+
+
+# ----------------------------- kalit so'zlar (avto-javob) -----------------------------
+def keywords(bot_id):
+    with conn() as c:
+        return c.execute("SELECT * FROM keywords WHERE bot_id=? ORDER BY word", (bot_id,)).fetchall()
+
+
+def get_keyword(kid):
+    with conn() as c:
+        return c.execute("SELECT * FROM keywords WHERE id=?", (kid,)).fetchone()
+
+
+def keyword_by_word(bot_id, word):
+    with conn() as c:
+        return c.execute("SELECT * FROM keywords WHERE bot_id=? AND word=?", (bot_id, word.strip().lower())).fetchone()
+
+
+def add_keyword(bot_id, word, content_id):
+    with conn() as c:
+        try:
+            return c.execute("INSERT INTO keywords(bot_id,word,content_id) VALUES(?,?,?)",
+                             (bot_id, word.strip().lower(), content_id)).lastrowid
+        except sqlite3.IntegrityError:
+            return None
+
+
+def del_keyword(kid):
+    r = get_keyword(kid)
+    if r:
+        delete_content(r["content_id"])
+        with conn() as c:
+            c.execute("DELETE FROM keywords WHERE id=?", (kid,))
+
+
+# ----------------------------- qo'shimcha adminlar -----------------------------
+def bot_admins(bot_id):
+    with conn() as c:
+        return [r[0] for r in c.execute("SELECT user_id FROM bot_admins WHERE bot_id=? ORDER BY added", (bot_id,))]
+
+
+def is_bot_admin(bot_id, uid):
+    with conn() as c:
+        return c.execute("SELECT 1 FROM bot_admins WHERE bot_id=? AND user_id=?", (bot_id, uid)).fetchone() is not None
+
+
+def add_bot_admin(bot_id, uid):
+    with conn() as c:
+        try:
+            c.execute("INSERT INTO bot_admins(bot_id,user_id,added) VALUES(?,?,?)", (bot_id, uid, time.time()))
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def del_bot_admin(bot_id, uid):
+    with conn() as c:
+        c.execute("DELETE FROM bot_admins WHERE bot_id=? AND user_id=?", (bot_id, uid))
+
+
+# ----------------------------- eksport va kengaytirilgan statistika -----------------------------
+def cusers_export(bot_id):
+    with conn() as c:
+        return c.execute("SELECT user_id,name,username,balance,refs,referrer_id,banned,active,joined,last_seen "
+                         "FROM cusers WHERE bot_id=? ORDER BY joined", (bot_id,)).fetchall()
+
+
+def join_series(bot_id, days=7):
+    """Oxirgi `days` kun uchun [(kun_belgisi, yangi_foydalanuvchilar)] — eskidan yangiga."""
+    day0 = util.midnight_ts()
+    out = []
+    with conn() as c:
+        for i in range(days - 1, -1, -1):
+            a, b = day0 - i * 86400, day0 - (i - 1) * 86400
+            n = c.execute("SELECT COUNT(*) FROM cusers WHERE bot_id=? AND joined>=? AND joined<?", (bot_id, a, b)).fetchone()[0]
+            out.append((util.fmt_dt(a)[:5], n))
+    return out
+
+
+def set_cactive(bot_id, uid, flag):
+    with conn() as c:
+        c.execute("UPDATE cusers SET active=? WHERE bot_id=? AND user_id=?", (1 if flag else 0, bot_id, uid))

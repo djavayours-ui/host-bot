@@ -1,0 +1,62 @@
+name: Avenor Builder bot
+
+on:
+  workflow_dispatch:          # qo'lda ishga tushirish: Actions → Run workflow
+  schedule:
+    - cron: "0 */6 * * *"     # har 6 soatda yangi ishga tushirish (oldingisi tugagach navbatdan boshlanadi)
+
+# Bir vaqtda faqat BITTA nusxa ishlasin (aks holda Telegram "Conflict" xatosi chiqadi).
+# cancel-in-progress: false — ishlayotgan botni uzmaydi, yangisi navbatda kutadi.
+concurrency:
+  group: avenor-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355      # GitHub chegarasi — 360 daqiqa
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+      DATA_DIR: data
+      TZ_NAME: Asia/Tashkent
+      BRAND: ${{ vars.BRAND || 'Avenor Builder' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Bog'liqliklarni o'rnatish
+        run: pip install -r requirements.txt
+
+      - name: Testlar
+        run: python -m unittest discover -s tests
+
+      # Ma'lumotlar bazasini oldingi ishga tushirishdan tiklash
+      - name: Bazani tiklash
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: avenor-data-${{ github.run_id }}
+          restore-keys: avenor-data-
+
+      - name: Botni ishga tushirish (~5 soat 45 daqiqa)
+        run: |
+          mkdir -p data
+          # timeout bot jarayoniga SIGTERM yuboradi; 124 — kutilgan chiqish
+          timeout --signal=TERM 20700 python main.py || code=$?
+          if [ "${code:-0}" -ne 0 ] && [ "${code:-0}" -ne 124 ]; then exit "$code"; fi
+
+      # Bot to'xtagach (yoki qo'lda bekor qilinganda ham) bazani saqlash
+      - name: Bazani saqlash
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: avenor-data-${{ github.run_id }}
