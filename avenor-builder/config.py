@@ -10,4 +10,7 @@ DATA_DIR = os.getenv("DATA_DIR", "data")
 TZ_NAME = os.getenv("TZ_NAME", "Asia/Tashkent")
 BRAND = os.getenv("BRAND", "Avenor Builder")
 
+# Bot necha soniya ishlagach o'zi tartibli to'xtasin (0 — cheklovsiz). GitHub Actions'da workflow beradi.
+RUN_SECONDS = int(re.sub(r"\D", "", os.getenv("RUN_SECONDS") or "") or 0)
+
 MASTER_USERNAME = ""   # ishga tushganda main.py to'ldiradi (deep-link uchun)

@@ -794,3 +794,16 @@ def join_series(bot_id, days=7):
 def set_cactive(bot_id, uid, flag):
     with conn() as c:
         c.execute("UPDATE cusers SET active=? WHERE bot_id=? AND user_id=?", (1 if flag else 0, bot_id, uid))
+
+
+# ----------------------------- oddiy kalit-qiymat (ichki holat) -----------------------------
+def raw_get(key, default=""):
+    with conn() as c:
+        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else default
+
+
+def raw_set(key, value):
+    with conn() as c:
+        c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                  (key, str(value)))

@@ -151,3 +151,17 @@ def csv_cell(v):
     """CSV/Excel formula in'ektsiyasidan himoya: =,+,-,@ bilan boshlangan matn oldiga ' qo'yiladi."""
     s = "" if v is None else str(v)
     return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
+
+
+def fmt_dur(sec):
+    """Davomiylik: '5 soat 12 daqiqa' · '7 daqiqa 05 soniya' · '42 soniya'."""
+    sec = max(0, int(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h} soat {m:02d} daqiqa"
+    if m >= 10:
+        return f"{m} daqiqa"
+    if m:
+        return f"{m} daqiqa {s:02d} soniya"
+    return f"{s} soniya"

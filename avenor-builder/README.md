@@ -56,6 +56,8 @@ Yaratish: mukofot → **nechta kod** (yoki o'z kodingiz) → har kod **necha mar
 - Asosiy admin: `/backup` — bazaning izchil zaxira nusxasini yuboradi.
 - **Panel bitta xabarda ishlaydi:** yangi bo'lim ochilganda yoki qiymat so'ralganda bot yangi xabar yubormaydi — joriy xabarning o'zi tahrirlanadi, siz yuborgan javob esa chatdan o'chiriladi (xabar yuborish uchun yuborilgan xabar bundan mustasno).
 - **Ikki marta javob himoyasi:** bir xil `update_id` ikkinchi marta qayta ishlanmaydi. Agar bot **ikki joyda** (masalan, server va GitHub Actions'da) ishlayotgan bo'lsa, `Conflict` xatosi ketma-ket 3 marta takrorlanganda egasi va adminlarga ogohlantirish yuboriladi.
+- **Holat xabari (ETA):** bot ishga tushgach `ADMIN_IDS` dagi adminlarga «✅ Botingiz ishga tushdi — run bo'ldi!» xabari boradi: hodisa (rejali qayta ishga tushirish / qo'lda / kod yangilandi + commit matni va versiya), ishlagan vaqt, **keyingi yangilanishgacha qolgan vaqt (ETA, progress-bar bilan)** va voqealar ro'yxati. Shu xabarning o'zi tahrirlanib turadi (tugashga yaqinlashgan sari tez-tez: 60 → 30 → 10 soniya). Yangilanishda xabar «🔄 qayta ishga tushirish boshlandi» holatiga o'tadi, yangi seans esa yangi xabar yuboradi (eskisi «tugagan» deb belgilanadi). Adminlar asosiy botga kamida bir marta `/start` bosgan bo'lsin. `RUN_SECONDS` berilmasa (oddiy server) ETA ko'rsatilmaydi.
+- GitHub'da `main`/`master` ga push qilinsa, ishlayotgan bot tartibli to'xtab, yangi kod darhol ishga tushadi (`.md` fayllar bundan mustasno).
 - Eski bazalar avtomatik yangilanadi (ustunlar o'zi qo'shiladi).
 
 ## GitHub Actions'da ishga tushirish (`.github/workflows/bot.yml`)
