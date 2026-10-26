@@ -54,6 +54,8 @@ Yaratish: mukofot → **nechta kod** (yoki o'z kodingiz) → har kod **necha mar
 - **Xabar yuborishni to'xtatish** tugmasi; **flood himoyasi** (10 soniyada 20 tadan ko'p so'rov e'tiborsiz).
 - Yangi o'zgaruvchilar: `%referrals%`, `%ref_link%`.
 - Asosiy admin: `/backup` — bazaning izchil zaxira nusxasini yuboradi.
+- **Panel bitta xabarda ishlaydi:** yangi bo'lim ochilganda yoki qiymat so'ralganda bot yangi xabar yubormaydi — joriy xabarning o'zi tahrirlanadi, siz yuborgan javob esa chatdan o'chiriladi (xabar yuborish uchun yuborilgan xabar bundan mustasno).
+- **Ikki marta javob himoyasi:** bir xil `update_id` ikkinchi marta qayta ishlanmaydi. Agar bot **ikki joyda** (masalan, server va GitHub Actions'da) ishlayotgan bo'lsa, `Conflict` xatosi ketma-ket 3 marta takrorlanganda egasi va adminlarga ogohlantirish yuboriladi.
 - Eski bazalar avtomatik yangilanadi (ustunlar o'zi qo'shiladi).
 
 ## GitHub Actions'da ishga tushirish (`.github/workflows/bot.yml`)

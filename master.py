@@ -13,7 +13,7 @@ from aiogram.types import CallbackQuery, LabeledPrice, Message, PreCheckoutQuery
 import config
 import db
 import util
-from child import B, M, cb_int, show
+from child import B, M, cb_int, open_prompt, say, show
 from storage import SqliteStorage
 from util import esc
 
@@ -70,16 +70,11 @@ def answer(act):
 
 
 async def ask(obj, state, act, prompt, back, **data):
+    old = await state.get_data()
     await state.clear()
     await state.set_state(S.ask)
-    await state.update_data(act=act, back=back, **data)
-    msg = obj.message if isinstance(obj, CallbackQuery) else obj
-    await msg.answer(prompt, reply_markup=M([B("❌ Bekor qilish", back)]))
-    if isinstance(obj, CallbackQuery):
-        try:
-            await obj.answer()
-        except TelegramBadRequest:
-            pass
+    pid, pchat = await open_prompt(obj, old, prompt, back)
+    await state.update_data(act=act, back=back, cancel=back, prompt=prompt, pid=pid, pchat=pchat, **data)
 
 
 @router.message(S.ask)
@@ -239,23 +234,23 @@ async def a_token(m: Message, state, d, bot):
     except Exception:
         pass
     if not TOKEN_RE.fullmatch(tok):
-        return await m.answer("❌ Token formati noto'g'ri. Qayta yuboring yoki bekor qiling.")
+        return await say(m, d, "❌ Token formati noto'g'ri. Qayta yuboring yoki bekor qiling.")
     mx = db.get_s("max_bots")
     if m.from_user.id not in config.ADMIN_IDS and db.count_bots(m.from_user.id) >= mx:
         await state.clear()
-        return await m.answer(f"❌ Bot limiti ({mx}) to'lgan.")
+        return await say(m, d, f"❌ Bot limiti ({mx}) to'lgan.")
     try:
         me = await mgr.make_bot(tok).get_me()
     except TelegramUnauthorizedError:
-        return await m.answer("❌ Token ishlamayapti (bekor qilingan yoki noto'g'ri). Qayta yuboring.")
+        return await say(m, d, "❌ Token ishlamayapti (bekor qilingan yoki noto'g'ri). Qayta yuboring.")
     except Exception as e:
-        return await m.answer(f"❌ Tokenni tekshirib bo'lmadi: {esc(e)}")
+        return await say(m, d, f"❌ Tokenni tekshirib bo'lmadi: {esc(e)}")
     if db.get_bot(me.id):
-        return await m.answer("❌ Bu bot allaqachon ulangan.")
+        return await say(m, d, "❌ Bu bot allaqachon ulangan.")
     row = db.create_bot_with_defaults(me.id, m.from_user.id, tok, me.username, me.full_name)
     await mgr.start_bot(row)
     await state.clear()
-    await m.answer(f"✅ <b>@{esc(me.username)}</b> yaratildi va ishga tushdi!\n\n"
+    await say(m, d, f"✅ <b>@{esc(me.username)}</b> yaratildi va ishga tushdi!\n\n"
                    "Endi botga kirib <code>/start</code>, so'ng <code>/admin</code> yuboring — u yerda hamma narsani sozlaysiz.",
                    reply_markup=M([B("🔗 Botni ochish", url=f"https://t.me/{me.username}")],
                                   [B("📂 Botlarim", "my:0"), B("⬅️ Menyu", "home")]))
@@ -330,17 +325,17 @@ async def a_retoken(m: Message, state, d, bot):
     except Exception:
         pass
     if not TOKEN_RE.fullmatch(tok):
-        return await m.answer("❌ Token formati noto'g'ri.")
+        return await say(m, d, "❌ Token formati noto'g'ri.")
     try:
         me = await mgr.make_bot(tok).get_me()
     except Exception:
-        return await m.answer("❌ Token ishlamayapti.")
+        return await say(m, d, "❌ Token ishlamayapti.")
     if me.id != d["bot_id"]:
-        return await m.answer("❌ Bu boshqa botning tokeni. Faqat shu botning tokenini yuboring.")
+        return await say(m, d, "❌ Bu boshqa botning tokeni. Faqat shu botning tokenini yuboring.")
     db.update_bot(me.id, token=tok, active=1)
     await mgr.start_bot(db.get_bot(me.id))
     await state.clear()
-    await m.answer("✅ Token yangilandi, bot qayta ishga tushdi.", reply_markup=M([B("⬅️ Bot", f"bot:{me.id}")]))
+    await say(m, d, "✅ Token yangilandi, bot qayta ishga tushdi.", reply_markup=M([B("⬅️ Bot", f"bot:{me.id}")]))
 
 
 @router.callback_query(F.data.startswith("bd:"))
@@ -436,8 +431,10 @@ async def a_topup(m: Message, state, d, bot):
     try:
         stars = util.parse_int(m.text, 1, db.get_s("topup_max"))
     except ValueError:
-        return await m.answer(f"❌ 1 dan {db.get_s('topup_max')} gacha butun son yuboring.")
+        return await say(m, d, f"❌ 1 dan {db.get_s('topup_max')} gacha butun son yuboring.")
     await state.clear()
+    text, kb = scr_wallet(db.get_user(m.from_user.id))
+    await say(m, d, text, kb)
     await send_topup(bot, m.from_user.id, stars)
 
 
@@ -477,8 +474,8 @@ async def a_promo(m: Message, state, d, bot):
     code = re.sub(r"[^A-Za-z0-9]", "", (m.text or "")).upper()
     st, reward = db.promo_redeem(code, m.from_user.id) if code else ("notfound", 0)
     if st != "ok":
-        return await m.answer(PROMO_MSG.get(st, "❌ Xatolik") + "\nBoshqa kod yuboring yoki bekor qiling.")
+        return await say(m, d, PROMO_MSG.get(st, "❌ Xatolik") + "\nBoshqa kod yuboring yoki bekor qiling.")
     await state.clear()
     me = db.get_user(m.from_user.id)
-    await m.answer(f"🎉 Promokod qabul qilindi: <b>+{db.money(reward)}</b>\n💰 Balans: {db.money(me['balance'])}",
+    await say(m, d, f"🎉 Promokod qabul qilindi: <b>+{db.money(reward)}</b>\n💰 Balans: {db.money(me['balance'])}",
                    reply_markup=M([B("🛒 Do'kon", "shop"), B("⬅️ Menyu", "home")]))

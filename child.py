@@ -559,14 +559,64 @@ def answer(act):
     return deco
 
 
+async def _drop(m):
+    try:
+        await m.delete()
+    except Exception:
+        pass
+
+
+async def _edit_or_send(m, pid, pchat, text, kb, keep=False):
+    """Panel xabarini (pid) tahrirlaydi; iloji bo'lmasa yangisini yuboradi. (pid, chat_id) qaytaradi.
+    Foydalanuvchining javob xabari chat toza qolishi uchun o'chiriladi (keep=True bo'lmasa)."""
+    if pid and pchat == m.chat.id:
+        try:
+            await m.bot.edit_message_text(text, chat_id=pchat, message_id=pid, reply_markup=kb)
+            ok = True
+        except TelegramBadRequest as e:
+            ok = "not modified" in str(e).lower()
+        if ok:
+            if not keep:
+                await _drop(m)
+            return pid, pchat
+    sent = await m.answer(text, reply_markup=kb)
+    return sent.message_id, m.chat.id
+
+
+async def open_prompt(obj, old, prompt, cancel_cb):
+    """So'rov matnini yangi xabar emas, joriy panel xabarida ko'rsatadi. (pid, chat_id) qaytaradi."""
+    kb = M([B("❌ Bekor qilish", cancel_cb)])
+    if isinstance(obj, CallbackQuery):
+        msg = obj.message
+        pid, pchat = msg.message_id, msg.chat.id
+        try:
+            await msg.edit_text(prompt, reply_markup=kb)
+        except TelegramBadRequest as e:
+            if "not modified" not in str(e).lower():
+                pid = (await msg.answer(prompt, reply_markup=kb)).message_id
+        try:
+            await obj.answer()
+        except TelegramBadRequest:
+            pass
+        return pid, pchat
+    return await _edit_or_send(obj, old.get("pid"), old.get("pchat"), prompt, kb)
+
+
+async def say(m, d, text, reply_markup=None, keep=False):
+    """Javobni alohida xabar sifatida emas, panel xabarini tahrirlab ko'rsatadi.
+    Xato matni (❌/ℹ️/⚠️, tugmasiz) bo'lsa — so'rov matni qayta ko'rsatiladi."""
+    if reply_markup is None and d.get("prompt") and text.lstrip().startswith(("❌", "ℹ️", "⚠️")):
+        text = f"{text}\n\n{d['prompt']}"
+        reply_markup = M([B("❌ Bekor qilish", d.get("cancel") or "x:a:home")])
+    await _edit_or_send(m, d.get("pid"), d.get("pchat"), text, reply_markup, keep)
+
+
 async def ask(obj, state, act, prompt, back, **data):
+    old = await state.get_data()
     await state.clear()
     await state.set_state(S.ask)
-    await state.update_data(act=act, back=back, **data)
-    msg = obj.message if isinstance(obj, CallbackQuery) else obj
-    await msg.answer(prompt, reply_markup=M([B("❌ Bekor qilish", "x:" + back)]))
-    if isinstance(obj, CallbackQuery):
-        await obj.answer()
+    pid, pchat = await open_prompt(obj, old, prompt, "x:" + back)
+    await state.update_data(act=act, back=back, cancel="x:" + back, prompt=prompt, pid=pid, pchat=pchat, **data)
 
 
 @admin_r.message(IsAdmin(), Command("admin"))
@@ -693,13 +743,13 @@ async def r_cw(x):
 async def a_cw(m, state, d, bot, cbot):
     new = ct.extract(m)
     if not new:
-        return await m.answer("❌ Bu turdagi xabar qo'llab-quvvatlanmaydi. Matn, rasm, video, fayl, audio, GIF, stiker yuboring.")
+        return await say(m, d, "❌ Bu turdagi xabar qo'llab-quvvatlanmaydi. Matn, rasm, video, fayl, audio, GIF, stiker yuboring.")
     if not own_content_id(cbot, d["cid"]):
         return await state.clear()
     db.replace_content(d["cid"], new)
     await state.clear()
     text, kb = scr_ce(cbot, d["cid"])
-    await m.answer("✅ Xabar yangilandi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Xabar yangilandi.\n\n" + text, reply_markup=kb)
 
 
 def own_content_id(cbot, cid):
@@ -773,7 +823,7 @@ def check_value(kind, text):
 async def a_ib_value(m, state, d, bot, cbot):
     val, err = check_value(d["kind"], m.text if m.text else "")
     if err:
-        return await m.answer("❌ " + err)
+        return await say(m, d, "❌ " + err)
     await ask(m, state, "ib_text", "✏️ Tugma matnini yuboring (maks. 64 belgi). O'zgaruvchilar mumkin: <code>%name%</code>, "
                                     "<code>%balance%</code>...", f"ia:{d['cid']}", flow="ib", cid=d["cid"], kind=d["kind"], value=val)
 
@@ -782,10 +832,10 @@ async def a_ib_value(m, state, d, bot, cbot):
 async def a_ib_text(m, state, d, bot, cbot):
     t = (m.text or "").strip()
     if not 1 <= len(t) <= 64:
-        return await m.answer("❌ Matn 1–64 belgi bo'lsin.")
+        return await say(m, d, "❌ Matn 1–64 belgi bo'lsin.")
     await state.set_state(None)
     await state.update_data(text=t, act=None)
-    await m.answer("🎨 Tugma rangini tanlang:", reply_markup=style_picker("is", f"ia:{d['cid']}"))
+    await say(m, d, "🎨 Tugma rangini tanlang:", reply_markup=style_picker("is", f"ia:{d['cid']}"))
 
 
 async def r_it(x):  # «Buyruq» tugmasi uchun nishon tanlandi
@@ -872,11 +922,11 @@ async def r_ibt(x):
 async def a_ibt(m, state, d, bot, cbot):
     t = (m.text or "").strip()
     if not 1 <= len(t) <= 64:
-        return await m.answer("❌ Matn 1–64 belgi bo'lsin.")
+        return await say(m, d, "❌ Matn 1–64 belgi bo'lsin.")
     db.update_ibutton(d["iid"], text=t)
     await state.clear()
     text, kb = scr_ib(d["iid"])
-    await m.answer("✅ Saqlandi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Saqlandi.\n\n" + text, reply_markup=kb)
 
 
 async def r_ibc(x):
@@ -909,11 +959,11 @@ async def r_ibv(x):
 async def a_ibv(m, state, d, bot, cbot):
     val, err = check_value(d["kind"], m.text if m.text else "")
     if err:
-        return await m.answer("❌ " + err)
+        return await say(m, d, "❌ " + err)
     db.update_ibutton(d["iid"], value=val)
     await state.clear()
     text, kb = scr_ib(d["iid"])
-    await m.answer("✅ Saqlandi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Saqlandi.\n\n" + text, reply_markup=kb)
 
 
 async def r_ibd(x):
@@ -953,9 +1003,9 @@ async def r_rb_add(x):
 async def a_rb_name(m, state, d, bot, cbot):
     t = (m.text or "").strip()
     if not 1 <= len(t) <= 64 or t.startswith("/"):
-        return await m.answer("❌ Matn 1–64 belgi bo'lsin va «/» bilan boshlanmasin.")
+        return await say(m, d, "❌ Matn 1–64 belgi bo'lsin va «/» bilan boshlanmasin.")
     if db.rbutton_by_text(cbot["id"], t):
-        return await m.answer("❌ Bunday tugma allaqachon bor. Boshqa nom yuboring.")
+        return await say(m, d, "❌ Bunday tugma allaqachon bor. Boshqa nom yuboring.")
     await ask(m, state, "rb_msg", "📝 Endi shu tugma bosilganda yuboriladigan xabarni yuboring (har qanday turda).", "rbl", name=t)
 
 
@@ -963,10 +1013,10 @@ async def a_rb_name(m, state, d, bot, cbot):
 async def a_rb_msg(m, state, d, bot, cbot):
     new = ct.extract(m)
     if not new:
-        return await m.answer("❌ Bu turdagi xabar qo'llab-quvvatlanmaydi.")
+        return await say(m, d, "❌ Bu turdagi xabar qo'llab-quvvatlanmaydi.")
     await state.set_state(None)
     await state.update_data(act=None, flow="rb", content=new, cid=0)
-    await m.answer("🎨 Tugma rangini tanlang:", reply_markup=style_picker("is", "rbl"))
+    await say(m, d, "🎨 Tugma rangini tanlang:", reply_markup=style_picker("is", "rbl"))
 
 
 async def r_rbn(x):
@@ -980,11 +1030,11 @@ async def a_rbn(m, state, d, bot, cbot):
     t = (m.text or "").strip()
     ex = db.rbutton_by_text(cbot["id"], t)
     if not 1 <= len(t) <= 64 or t.startswith("/") or (ex and ex["id"] != d["rid"]):
-        return await m.answer("❌ Nom 1–64 belgi, «/»siz va takrorlanmas bo'lsin.")
+        return await say(m, d, "❌ Nom 1–64 belgi, «/»siz va takrorlanmas bo'lsin.")
     db.update_rbutton(d["rid"], text=t)
     await state.clear()
     text, kb = scr_rb(d["rid"])
-    await m.answer("✅ Saqlandi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Saqlandi.\n\n" + text, reply_markup=kb)
 
 
 async def r_rbc(x):
@@ -1041,9 +1091,9 @@ async def r_cm_add(x):
 async def a_cm_name(m, state, d, bot, cbot):
     t = (m.text or "").strip().lstrip("/").lower()
     if not re.fullmatch(r"[a-z0-9_]{1,32}", t) or t in RESERVED:
-        return await m.answer("❌ Nom noto'g'ri yoki band (start, admin, cancel mumkin emas).")
+        return await say(m, d, "❌ Nom noto'g'ri yoki band (start, admin, cancel mumkin emas).")
     if db.command_by_name(cbot["id"], t):
-        return await m.answer("❌ Bunday buyruq bor.")
+        return await say(m, d, "❌ Bunday buyruq bor.")
     await ask(m, state, "cm_msg", f"📝 /{t} yuborilganda chiqadigan xabarni yuboring (har qanday turda).", "cml", name=t)
 
 
@@ -1051,15 +1101,15 @@ async def a_cm_name(m, state, d, bot, cbot):
 async def a_cm_msg(m, state, d, bot, cbot):
     new = ct.extract(m)
     if not new:
-        return await m.answer("❌ Bu turdagi xabar qo'llab-quvvatlanmaydi.")
+        return await say(m, d, "❌ Bu turdagi xabar qo'llab-quvvatlanmaydi.")
     cid = db.add_content(cbot["id"], new)
     cmid = db.add_command(cbot["id"], d["name"], cid)
     if not cmid:
         db.delete_content(cid)
-        return await m.answer("❌ Bunday buyruq allaqachon bor.")
+        return await say(m, d, "❌ Bunday buyruq allaqachon bor.")
     await state.clear()
     text, kb = scr_cm(cmid)
-    await m.answer("✅ Buyruq qo'shildi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Buyruq qo'shildi.\n\n" + text, reply_markup=kb)
 
 
 async def r_cmd(x):
@@ -1104,34 +1154,34 @@ async def r_ch_add(x):
 async def a_ch_add(m, state, d, bot, cbot):
     if len(db.channels(cbot["id"])) >= db.limit(db.get_bot(cbot["id"]), "channel"):
         await state.clear()
-        return await m.answer("⚠️ Kanallar limiti to'lgan.")
+        return await say(m, d, "⚠️ Kanallar limiti to'lgan.")
     ref = chat_ref(m)
     if ref is None:
-        return await m.answer("❌ Tushunmadim. @username, -100... ID yuboring yoki kanaldan post forward qiling.")
+        return await say(m, d, "❌ Tushunmadim. @username, -100... ID yuboring yoki kanaldan post forward qiling.")
     try:
         chat = await bot.get_chat(ref)
     except Exception:
-        return await m.answer("❌ Kanal topilmadi. Botni kanalga administrator qilib qo'shganingizni tekshiring.")
+        return await say(m, d, "❌ Kanal topilmadi. Botni kanalga administrator qilib qo'shganingizni tekshiring.")
     if getattr(chat.type, "value", chat.type) not in ("channel", "supergroup", "group"):
-        return await m.answer("❌ Bu kanal yoki guruh emas.")
+        return await say(m, d, "❌ Bu kanal yoki guruh emas.")
     try:
         me = await bot.get_chat_member(chat.id, bot.id)
         is_admin = getattr(me.status, "value", me.status) in ("administrator", "creator")
     except Exception:
         is_admin = False
     if not is_admin:
-        return await m.answer("❌ Bot bu kanalda administrator emas. Avval botni kanalga admin qiling, so'ng qayta yuboring.")
+        return await say(m, d, "❌ Bot bu kanalda administrator emas. Avval botni kanalga admin qiling, so'ng qayta yuboring.")
     url = f"https://t.me/{chat.username}" if chat.username else ""
     if not url:
         try:
             url = (await bot.create_chat_invite_link(chat.id)).invite_link
         except Exception:
-            return await m.answer("❌ Kanal yopiq: botga «Taklif havolalari» huquqini bering yoki kanalni ommaviy qiling.")
+            return await say(m, d, "❌ Kanal yopiq: botga «Taklif havolalari» huquqini bering yoki kanalni ommaviy qiling.")
     if not db.add_channel(cbot["id"], chat.id, chat.title, chat.username, url):
-        return await m.answer("❌ Bu kanal allaqachon qo'shilgan.")
+        return await say(m, d, "❌ Bu kanal allaqachon qo'shilgan.")
     await state.clear()
     text, kb = scr_sub(cbot)
-    await m.answer("✅ Kanal qo'shildi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Kanal qo'shildi.\n\n" + text, reply_markup=kb)
 
 
 def own_ch(x, chid):
@@ -1156,11 +1206,11 @@ async def r_chl(x):
 async def a_chl(m, state, d, bot, cbot):
     t = (m.text or "").strip()
     if not t or len(t) > 64:
-        return await m.answer("❌ Matn 1–64 belgi bo'lsin.")
+        return await say(m, d, "❌ Matn 1–64 belgi bo'lsin.")
     db.update_channel(d["chid"], label="" if t == "-" else t)
     await state.clear()
     text, kb = scr_ch(d["chid"])
-    await m.answer("✅ Saqlandi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Saqlandi.\n\n" + text, reply_markup=kb)
 
 
 async def r_chu(x):
@@ -1173,11 +1223,11 @@ async def r_chu(x):
 async def a_chu(m, state, d, bot, cbot):
     t = (m.text or "").strip()
     if not re.fullmatch(r"(https?://|tg://)\S{3,500}", t):
-        return await m.answer("❌ URL <code>https://</code> yoki <code>tg://</code> bilan boshlansin.")
+        return await say(m, d, "❌ URL <code>https://</code> yoki <code>tg://</code> bilan boshlansin.")
     db.update_channel(d["chid"], url=t)
     await state.clear()
     text, kb = scr_ch(d["chid"])
-    await m.answer("✅ Saqlandi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Saqlandi.\n\n" + text, reply_markup=kb)
 
 
 async def r_chd(x):
@@ -1201,22 +1251,22 @@ async def r_sc(x):
 async def a_sj(m, state, d, bot, cbot):
     t = (m.text or "").strip()
     if not 1 <= len(t) <= 64:
-        return await m.answer("❌ Matn 1–64 belgi bo'lsin.")
+        return await say(m, d, "❌ Matn 1–64 belgi bo'lsin.")
     db.update_bot(cbot["id"], join_text=t)
     await state.clear()
     text, kb = scr_sub(cbot)
-    await m.answer("✅ Saqlandi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Saqlandi.\n\n" + text, reply_markup=kb)
 
 
 @answer("sc")
 async def a_sc(m, state, d, bot, cbot):
     t = (m.text or "").strip()
     if not 1 <= len(t) <= 64:
-        return await m.answer("❌ Matn 1–64 belgi bo'lsin.")
+        return await say(m, d, "❌ Matn 1–64 belgi bo'lsin.")
     db.update_bot(cbot["id"], check_text=t)
     await state.clear()
     text, kb = scr_sub(cbot)
-    await m.answer("✅ Saqlandi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Saqlandi.\n\n" + text, reply_markup=kb)
 
 
 async def r_sst(x):
@@ -1241,8 +1291,8 @@ async def a_bc_msg(m, state, d, bot, cbot):
     n = len(db.cuser_ids(cbot["id"]))
     await state.set_state(None)
     await state.update_data(act=None, src_chat=m.chat.id, src_msg=m.message_id)
-    await m.answer(f"📣 Xabar <b>{n}</b> ta foydalanuvchiga yuboriladi. Tasdiqlaysizmi?",
-                   reply_markup=M([B("✅ Yuborish", "bcgo")], [B("❌ Bekor qilish", "x:a:home")]))
+    await say(m, d, f"📣 Xabar <b>{n}</b> ta foydalanuvchiga yuboriladi. Tasdiqlaysizmi?",
+              reply_markup=M([B("✅ Yuborish", "bcgo")], [B("❌ Bekor qilish", "x:a:home")]), keep=True)
 
 
 async def r_bcgo(x):
@@ -1306,10 +1356,10 @@ async def a_bal_id(m, state, d, bot, cbot):
     try:
         uid = util.parse_int(m.text, 1)
     except ValueError:
-        return await m.answer("❌ ID raqam yuboring.")
+        return await say(m, d, "❌ ID raqam yuboring.")
     u = db.get_cuser(cbot["id"], uid)
     if not u:
-        return await m.answer("❌ Bu foydalanuvchi shu botga hali /start bosmagan.")
+        return await say(m, d, "❌ Bu foydalanuvchi shu botga hali /start bosmagan.")
     await ask(m, state, "bal_amt", f"💰 {esc(u['name'])} — hozirgi balans: <b>{u['balance']}</b>\n"
                                    "Miqdorni yuboring: <code>+50</code> qo'shish, <code>-20</code> ayirish, <code>=100</code> aniq qiymat.",
               "a:home", uid=uid)
@@ -1322,13 +1372,13 @@ async def a_bal_amt(m, state, d, bot, cbot):
     try:
         amount = int(t.lstrip("="))
     except ValueError:
-        return await m.answer("❌ Masalan: <code>+50</code>, <code>-20</code>, <code>=100</code>")
+        return await say(m, d, "❌ Masalan: <code>+50</code>, <code>-20</code>, <code>=100</code>")
     nb = db.change_cbalance(cbot["id"], d["uid"], mode, amount)
     await state.clear()
     if nb is None:
-        return await m.answer("❌ Foydalanuvchi topilmadi.")
+        return await say(m, d, "❌ Foydalanuvchi topilmadi.")
     text, kb = scr_home(cbot)
-    await m.answer(f"✅ Yangi balans: <b>{nb}</b>\n\n" + text, reply_markup=kb)
+    await say(m, d, f"✅ Yangi balans: <b>{nb}</b>\n\n" + text, reply_markup=kb)
 
 
 @answer("ban_id")
@@ -1336,17 +1386,17 @@ async def a_ban_id(m, state, d, bot, cbot):
     try:
         uid = util.parse_int(m.text, 1)
     except ValueError:
-        return await m.answer("❌ ID raqam yuboring.")
+        return await say(m, d, "❌ ID raqam yuboring.")
     u = db.get_cuser(cbot["id"], uid)
     if not u:
-        return await m.answer("❌ Bu foydalanuvchi shu botga hali /start bosmagan.")
+        return await say(m, d, "❌ Bu foydalanuvchi shu botga hali /start bosmagan.")
     if uid == cbot["owner_id"] or uid in config.ADMIN_IDS or db.is_bot_admin(cbot["id"], uid):
-        return await m.answer("❌ Adminni ban qilib bo'lmaydi.")
+        return await say(m, d, "❌ Adminni ban qilib bo'lmaydi.")
     flag = not u["banned"]
     db.set_cban(cbot["id"], uid, flag)
     await state.clear()
     text, kb = scr_home(cbot)
-    await m.answer(("🚫 Ban qilindi: " if flag else "✅ Bandan chiqarildi: ") + f"<code>{uid}</code>\n\n" + text, reply_markup=kb)
+    await say(m, d, ("🚫 Ban qilindi: " if flag else "✅ Bandan chiqarildi: ") + f"<code>{uid}</code>\n\n" + text, reply_markup=kb)
 
 
 # ---- referal va bonus ----
@@ -1355,11 +1405,11 @@ async def a_eco_ref(m, state, d, bot, cbot):
     try:
         v = util.parse_int(m.text, 0, 1_000_000)
     except ValueError:
-        return await m.answer("❌ 0 dan 1 000 000 gacha butun son yuboring.")
+        return await say(m, d, "❌ 0 dan 1 000 000 gacha butun son yuboring.")
     db.update_bot(cbot["id"], ref_reward=v)
     await state.clear()
     text, kb = scr_eco(cbot)
-    await m.answer("✅ Saqlandi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Saqlandi.\n\n" + text, reply_markup=kb)
 
 
 @answer("eco_bonus")
@@ -1367,11 +1417,11 @@ async def a_eco_bonus(m, state, d, bot, cbot):
     try:
         v = util.parse_int(m.text, 0, 1_000_000)
     except ValueError:
-        return await m.answer("❌ 0 dan 1 000 000 gacha butun son yuboring.")
+        return await say(m, d, "❌ 0 dan 1 000 000 gacha butun son yuboring.")
     db.update_bot(cbot["id"], daily_bonus=v)
     await state.clear()
     text, kb = scr_eco(cbot)
-    await m.answer("✅ Saqlandi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Saqlandi.\n\n" + text, reply_markup=kb)
 
 
 # ---- foydalanuvchilar eksporti ----
@@ -1414,17 +1464,17 @@ async def a_adm_add(m, state, d, bot, cbot):
     try:
         uid = util.parse_int(m.text, 1)
     except ValueError:
-        return await m.answer("❌ ID raqam yuboring.")
+        return await say(m, d, "❌ ID raqam yuboring.")
     if not db.get_cuser(cbot["id"], uid):
-        return await m.answer("❌ Bu foydalanuvchi shu botga hali /start bosmagan.")
+        return await say(m, d, "❌ Bu foydalanuvchi shu botga hali /start bosmagan.")
     if is_owner_level(cbot, uid):
-        return await m.answer("ℹ️ Bu foydalanuvchi allaqachon admin.")
+        return await say(m, d, "ℹ️ Bu foydalanuvchi allaqachon admin.")
     if len(db.bot_admins(cbot["id"])) >= 10:
-        return await m.answer("❌ Maksimal 10 ta qo'shimcha admin.")
+        return await say(m, d, "❌ Maksimal 10 ta qo'shimcha admin.")
     ok = db.add_bot_admin(cbot["id"], uid)
     await state.clear()
     text, kb = scr_adm(cbot)
-    await m.answer(("✅ Admin qo'shildi.\n\n" if ok else "ℹ️ Bu admin allaqachon qo'shilgan.\n\n") + text, reply_markup=kb)
+    await say(m, d, ("✅ Admin qo'shildi.\n\n" if ok else "ℹ️ Bu admin allaqachon qo'shilgan.\n\n") + text, reply_markup=kb)
 
 
 async def r_admd(x):
@@ -1463,11 +1513,11 @@ async def r_kw_add(x):
 async def a_kw_word(m, state, d, bot, cbot):
     t = (m.text or "").strip()
     if not 1 <= len(t) <= 64 or t.startswith("/"):
-        return await m.answer("❌ 1–64 belgi bo'lsin va «/» bilan boshlanmasin.")
+        return await say(m, d, "❌ 1–64 belgi bo'lsin va «/» bilan boshlanmasin.")
     if db.keyword_by_word(cbot["id"], t):
-        return await m.answer("❌ Bunday kalit so'z allaqachon bor.")
+        return await say(m, d, "❌ Bunday kalit so'z allaqachon bor.")
     if db.rbutton_by_text(cbot["id"], t):
-        return await m.answer("❌ Bu matn pastki tugma nomi bilan bir xil — pastki tugma ustun turadi. Boshqa so'z yuboring.")
+        return await say(m, d, "❌ Bu matn pastki tugma nomi bilan bir xil — pastki tugma ustun turadi. Boshqa so'z yuboring.")
     await ask(m, state, "kw_msg", f"📝 «{esc(t)}» yozilganda chiqadigan xabarni yuboring (har qanday turda).", "kwl", word=t)
 
 
@@ -1475,18 +1525,18 @@ async def a_kw_word(m, state, d, bot, cbot):
 async def a_kw_msg(m, state, d, bot, cbot):
     new = ct.extract(m)
     if not new:
-        return await m.answer("❌ Bu turdagi xabar qo'llab-quvvatlanmaydi.")
+        return await say(m, d, "❌ Bu turdagi xabar qo'llab-quvvatlanmaydi.")
     if len(db.keywords(cbot["id"])) >= MAX_KEYWORDS:
         await state.clear()
-        return await m.answer(f"❌ Maksimal {MAX_KEYWORDS} ta kalit so'z.")
+        return await say(m, d, f"❌ Maksimal {MAX_KEYWORDS} ta kalit so'z.")
     cid = db.add_content(cbot["id"], new)
     kid = db.add_keyword(cbot["id"], d["word"], cid)
     if not kid:
         db.delete_content(cid)
-        return await m.answer("❌ Bunday kalit so'z allaqachon bor.")
+        return await say(m, d, "❌ Bunday kalit so'z allaqachon bor.")
     await state.clear()
     text, kb = scr_kw(kid)
-    await m.answer("✅ Kalit so'z qo'shildi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Kalit so'z qo'shildi.\n\n" + text, reply_markup=kb)
 
 
 async def r_kwd(x):

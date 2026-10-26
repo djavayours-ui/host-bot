@@ -12,7 +12,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, Message
 import config
 import db
 import util
-from child import B, M, cb_int, show
+from child import B, M, cb_int, say, show
 from master import AdminCbF, IsAdminF, admin_router, answer, ask, can_manage, scr_bot
 from util import esc
 
@@ -180,20 +180,20 @@ async def a_sv(m: Message, state, d, bot):
         try:
             val = util.parse_int(t, mn, 10**9)
         except ValueError:
-            return await m.answer(f"❌ {mn} yoki undan katta butun son yuboring.")
+            return await say(m, d, f"❌ {mn} yoki undan katta butun son yuboring.")
     elif kind == "pkgs":
         parts = [x.strip() for x in t.split(",") if x.strip()]
         if not parts or not all(x.isdigit() and 1 <= int(x) <= db.get_s("topup_max") for x in parts):
-            return await m.answer(f"❌ 1–{db.get_s('topup_max')} oralig'ida sonlarni vergul bilan yuboring.")
+            return await say(m, d, f"❌ 1–{db.get_s('topup_max')} oralig'ida sonlarni vergul bilan yuboring.")
         val = ",".join(str(int(x)) for x in parts[:8])
     else:
         if not 1 <= len(t) <= 20:
-            return await m.answer("❌ 1–20 belgi bo'lsin.")
+            return await say(m, d, "❌ 1–20 belgi bo'lsin.")
         val = t
     db.set_s(d["key"], val)
     await state.clear()
     text, kb = scr_settings(d["group"])
-    await m.answer("✅ Saqlandi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Saqlandi.\n\n" + text, reply_markup=kb)
 
 
 # ---------------- promokodlar ----------------
@@ -238,7 +238,7 @@ async def a_pr_reward(m, state, d, bot):
     try:
         reward = util.parse_int(m.text, 1, 10**9)
     except ValueError:
-        return await m.answer("❌ 1 yoki undan katta butun son yuboring.")
+        return await say(m, d, "❌ 1 yoki undan katta butun son yuboring.")
     await ask(m, state, "pr_qty", "2/5. Nechta kod yaratilsin? (1–500)\nYoki o'zingiz kod yozing (A–Z, 0–9, 4–16 belgi) — "
                                   "bitta kod yaratiladi. Avtomatik kodlar <code>A8BXG67H</code> ko'rinishida (8 belgi).",
               "ad:pr:0", reward=reward)
@@ -251,13 +251,13 @@ async def a_pr_qty(m, state, d, bot):
     if t.isdigit():
         qty = int(t)
         if not 1 <= qty <= 500:
-            return await m.answer("❌ 1–500 oralig'ida bo'lsin.")
+            return await say(m, d, "❌ 1–500 oralig'ida bo'lsin.")
     elif re.fullmatch(r"[A-Za-z0-9]{4,16}", t):
         qty, custom = 1, t.upper()
         if db.promo_get(custom):
-            return await m.answer("❌ Bunday kod allaqachon bor.")
+            return await say(m, d, "❌ Bunday kod allaqachon bor.")
     else:
-        return await m.answer("❌ Son (1–500) yoki kod (A–Z, 0–9, 4–16 belgi) yuboring.")
+        return await say(m, d, "❌ Son (1–500) yoki kod (A–Z, 0–9, 4–16 belgi) yuboring.")
     await ask(m, state, "pr_uses", "3/5. Har bir kod necha marta ishlatilsin? Butun son yoki <code>0</code> / <code>inf</code> — cheksiz.\n"
                                    "(Har foydalanuvchi bitta kodni faqat 1 marta ishlata oladi.)", "ad:pr:0",
               reward=d["reward"], qty=qty, custom=custom)
@@ -272,7 +272,7 @@ async def a_pr_uses(m, state, d, bot):
         try:
             uses = util.parse_int(t, 1, 10**9)
         except ValueError:
-            return await m.answer("❌ Butun son yoki 0 / inf yuboring.")
+            return await say(m, d, "❌ Butun son yoki 0 / inf yuboring.")
     await ask(m, state, "pr_expiry", "4/5. Amal qilish muddati: kun soni (masalan <code>7</code>), sana (<code>31.12.2026</code> "
                                      "yoki <code>2026-12-31 23:59</code>) yoki <code>0</code> — cheksiz.", "ad:pr:0",
               reward=d["reward"], qty=d["qty"], custom=d.get("custom"), uses=uses, uses_inf=uses is None)
@@ -283,7 +283,7 @@ async def a_pr_expiry(m, state, d, bot):
     try:
         exp = util.parse_when(m.text)
     except ValueError:
-        return await m.answer("❌ Sana formati noto'g'ri. Masalan: <code>7</code>, <code>31.12.2026</code> yoki <code>0</code>.")
+        return await say(m, d, "❌ Sana formati noto'g'ri. Masalan: <code>7</code>, <code>31.12.2026</code> yoki <code>0</code>.")
     await ask(m, state, "pr_start", "5/5. Qachondan boshlansin? <code>0</code> — darhol, yoki kun soni / sana (yuqoridagi formatda).",
               "ad:pr:0", reward=d["reward"], qty=d["qty"], custom=d.get("custom"), uses=d.get("uses"), expires=exp)
 
@@ -293,10 +293,10 @@ async def a_pr_start(m, state, d, bot):
     try:
         start = util.parse_when(m.text)
     except ValueError:
-        return await m.answer("❌ Sana formati noto'g'ri.")
+        return await say(m, d, "❌ Sana formati noto'g'ri.")
     exp = d.get("expires")
     if start and exp and start >= exp:
-        return await m.answer("❌ Boshlanish sanasi tugash sanasidan oldin bo'lishi kerak.")
+        return await say(m, d, "❌ Boshlanish sanasi tugash sanasidan oldin bo'lishi kerak.")
     batch = secrets.token_hex(4)
     codes = []
     if d.get("custom"):
@@ -311,16 +311,16 @@ async def a_pr_start(m, state, d, bot):
                 codes.append(code)
     await state.clear()
     if not codes:
-        return await m.answer("❌ Kod yaratib bo'lmadi (band bo'lishi mumkin).", reply_markup=M([B("⬅️ Promokodlar", "ad:pr:0")]))
+        return await say(m, d, "❌ Kod yaratib bo'lmadi (band bo'lishi mumkin).", reply_markup=M([B("⬅️ Promokodlar", "ad:pr:0")]))
     uses = d.get("uses")
     head = (f"✅ <b>{len(codes)}</b> ta promokod yaratildi.\nMukofot: {db.money(d['reward'])} · ishlatish: "
             f"{uses if uses is not None else '∞'} · tugash: {util.fmt_dt(exp) if exp else '∞'} · "
             f"boshlanish: {util.fmt_dt(start) if start else 'darhol'}")
     kb = M([B("🎟 Promokodlar", "ad:pr:0")])
     if len(codes) <= 30:
-        await m.answer(head + "\n\n" + "\n".join(f"<code>{c}</code>" for c in codes), reply_markup=kb)
+        await say(m, d, head + "\n\n" + "\n".join(f"<code>{c}</code>" for c in codes), reply_markup=kb)
     else:
-        await m.answer(head, reply_markup=kb)
+        await say(m, d, head, reply_markup=kb)
         await m.answer_document(BufferedInputFile("\n".join(codes).encode(), filename="promokodlar.txt"))
 
 
@@ -334,12 +334,12 @@ async def a_us_id(m, state, d, bot):
     try:
         uid = util.parse_int(m.text, 1)
     except ValueError:
-        return await m.answer("❌ ID raqam yuboring.")
+        return await say(m, d, "❌ ID raqam yuboring.")
     if not db.get_user(uid):
-        return await m.answer("❌ Bunday foydalanuvchi topilmadi.")
+        return await say(m, d, "❌ Bunday foydalanuvchi topilmadi.")
     await state.clear()
     text, kb = scr_user(uid)
-    await m.answer(text, reply_markup=kb)
+    await say(m, d, text, reply_markup=kb)
 
 
 async def ad_u(c, p, state, bot):
@@ -373,11 +373,11 @@ async def a_ua(m, state, d, bot):
     try:
         nb = parse_delta(m.text, u["balance"])
     except ValueError:
-        return await m.answer("❌ Masalan: <code>+50</code>, <code>-20</code>, <code>=100</code>")
+        return await say(m, d, "❌ Masalan: <code>+50</code>, <code>-20</code>, <code>=100</code>")
     db.add_balance(d["uid"], nb - u["balance"])
     await state.clear()
     text, kb = scr_user(d["uid"])
-    await m.answer("✅ Saqlandi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Saqlandi.\n\n" + text, reply_markup=kb)
 
 
 # ---------------- botlar ----------------
@@ -414,13 +414,13 @@ async def ad_gr(c, p, state, bot):
 async def a_gr(m, state, d, bot):
     mt = re.fullmatch(r"(inline|reply|channel)\s+(-?\d{1,4})", (m.text or "").strip().lower())
     if not mt:
-        return await m.answer("❌ Masalan: <code>inline 3</code>")
+        return await say(m, d, "❌ Masalan: <code>inline 3</code>")
     col = db.ITEMS[mt.group(1)]["col"]
     row = db.get_bot(d["bot_id"])
     db.update_bot(row["id"], **{col: max(0, row[col] + int(mt.group(2)))})
     await state.clear()
     text, kb = scr_bot(row, True)
-    await m.answer("✅ Saqlandi.\n\n" + text, reply_markup=kb)
+    await say(m, d, "✅ Saqlandi.\n\n" + text, reply_markup=kb)
 
 
 # ---------------- xabar yuborish (asosiy bot foydalanuvchilariga) ----------------
@@ -439,8 +439,8 @@ async def a_bc(m, state, d, bot):
     n = len(db.user_ids())
     await state.set_state(None)
     await state.update_data(act=None, src_chat=m.chat.id, src_msg=m.message_id)
-    await m.answer(f"📣 Xabar <b>{n}</b> ta foydalanuvchiga yuboriladi. Tasdiqlaysizmi?",
-                   reply_markup=M([B("✅ Yuborish", "ad:bcgo")], [B("❌ Bekor qilish", "ad")]))
+    await say(m, d, f"📣 Xabar <b>{n}</b> ta foydalanuvchiga yuboriladi. Tasdiqlaysizmi?",
+              reply_markup=M([B("✅ Yuborish", "ad:bcgo")], [B("❌ Bekor qilish", "ad")]), keep=True)
 
 
 KEEP.add("bcgo")
