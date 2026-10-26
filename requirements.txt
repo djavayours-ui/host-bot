@@ -1,8 +1,2 @@
-aiogram>=3.13,<4
-python-telegram-bot>=21
-pyTelegramBotAPI>=4.20
-requests>=2.31
+aiogram>=3.22,<4
 aiohttp>=3.9
-
-cryptography>=42,<47
-psutil>=5.9,<8

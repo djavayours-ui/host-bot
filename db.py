@@ -1,564 +1,634 @@
-"""Hosting bot ma'lumotlar bazasi (SQLite).
-
-v2: botlar, maxfiy kalitlar, foydalanuvchi limitlari, promo kodlar,
-zaxira nusxalar, broadcast tarixi va umumiy sozlamalar (kv) shu yerda saqlanadi.
-"""
+"""SQLite: barcha jadvallar va so'rovlar. Har chaqiriqda qisqa ulanish (WAL rejimi)."""
 import os
 import sqlite3
 import time
 from contextlib import contextmanager
 
-DATA_DIR = os.getenv("DATA_DIR", "data")
-
-_FIELDS = {
-    "name", "username", "token", "entry", "autorun", "want_running",
-    "git_repo", "git_branch", "last_error", "crashes", "pinned",
-}
-_USER_FIELDS = {"promo_until", "promo_code", "max_bots", "ai_daily", "note"}
+import config
+import util
 
 
-
-def db_path():
-    return os.path.join(DATA_DIR, "hosting.db")
-
-
-def bot_dir(host_id):
-    # Absolyut yo'l: bot jarayoni boshqa papkadan (cwd) ishga tushadi
-    return os.path.abspath(os.path.join(DATA_DIR, "bots", str(host_id)))
+def path():
+    return os.path.join(config.DATA_DIR, "builder.db")
 
 
 @contextmanager
-def _conn():
-    """Har chaqiruvda yangi ulanish: muvaffaqiyatda commit, xatoda rollback, doim yopiladi."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    c = sqlite3.connect(db_path(), timeout=20)
+def conn(tx=False):
+    os.makedirs(config.DATA_DIR, exist_ok=True)
+    c = sqlite3.connect(path(), timeout=20, isolation_level=None)
     c.row_factory = sqlite3.Row
     try:
+        if tx:
+            c.execute("BEGIN IMMEDIATE")
         yield c
-        c.commit()
+        if tx:
+            c.execute("COMMIT")
     except BaseException:
-        c.rollback()
+        if tx:
+            try:
+                c.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
         raise
     finally:
         c.close()
 
 
-def _columns(c, table):
-    return {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
-
-
-def _migrate(c):
-    """Eski (v1) bazani v2 sxemasiga ko'chiradi: ustunlar qo'shadi."""
-    add = {
-        "hosts": {
-            "git_repo": "TEXT", "git_branch": "TEXT", "last_error": "TEXT",
-            "crashes": "INTEGER NOT NULL DEFAULT 0", "pinned": "INTEGER NOT NULL DEFAULT 0",
-        },
-    }
-    add["users"] = {"blocked": "INTEGER NOT NULL DEFAULT 0", "last_seen": "REAL NOT NULL DEFAULT 0"}
-    for table, cols in add.items():
-        have = _columns(c, table)
-        for name, decl in cols.items():
-            if name not in have:
-                c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS users(
+    user_id INTEGER PRIMARY KEY, name TEXT, username TEXT, balance INTEGER NOT NULL DEFAULT 0,
+    banned INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, joined REAL, last_seen REAL);
+CREATE TABLE IF NOT EXISTS bots(
+    id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, token TEXT NOT NULL, username TEXT, name TEXT,
+    active INTEGER NOT NULL DEFAULT 1, created REAL,
+    extra_inline INTEGER NOT NULL DEFAULT 0, extra_reply INTEGER NOT NULL DEFAULT 0,
+    extra_channels INTEGER NOT NULL DEFAULT 0,
+    start_cid INTEGER, sub_cid INTEGER,
+    join_text TEXT NOT NULL DEFAULT '📢 %channel%', check_text TEXT NOT NULL DEFAULT '✅ Tekshirish',
+    join_style TEXT NOT NULL DEFAULT '', check_style TEXT NOT NULL DEFAULT 'success');
+CREATE INDEX IF NOT EXISTS bots_owner ON bots(owner_id);
+CREATE TABLE IF NOT EXISTS contents(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER NOT NULL, type TEXT NOT NULL, html TEXT NOT NULL DEFAULT '',
+    file_id TEXT, file_uid TEXT, spoiler INTEGER NOT NULL DEFAULT 0, created REAL);
+CREATE TABLE IF NOT EXISTS ibuttons(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, content_id INTEGER NOT NULL, rw INTEGER NOT NULL DEFAULT 0,
+    pos INTEGER NOT NULL DEFAULT 0, text TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL DEFAULT '',
+    style TEXT NOT NULL DEFAULT '');
+CREATE INDEX IF NOT EXISTS ib_content ON ibuttons(content_id);
+CREATE TABLE IF NOT EXISTS rbuttons(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER NOT NULL, rw INTEGER NOT NULL DEFAULT 0,
+    pos INTEGER NOT NULL DEFAULT 0, text TEXT NOT NULL, style TEXT NOT NULL DEFAULT '', content_id INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS rb_bot ON rbuttons(bot_id);
+CREATE TABLE IF NOT EXISTS commands(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER NOT NULL, name TEXT NOT NULL, content_id INTEGER NOT NULL,
+    UNIQUE(bot_id, name));
+CREATE TABLE IF NOT EXISTS channels(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, title TEXT,
+    username TEXT, url TEXT NOT NULL DEFAULT '', label TEXT NOT NULL DEFAULT '');
+CREATE INDEX IF NOT EXISTS ch_bot ON channels(bot_id);
+CREATE TABLE IF NOT EXISTS cusers(
+    bot_id INTEGER NOT NULL, user_id INTEGER NOT NULL, name TEXT, username TEXT,
+    balance INTEGER NOT NULL DEFAULT 0, banned INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
+    joined REAL, last_seen REAL, PRIMARY KEY(bot_id, user_id));
+CREATE TABLE IF NOT EXISTS promos(
+    code TEXT PRIMARY KEY, reward INTEGER NOT NULL, max_uses INTEGER, used INTEGER NOT NULL DEFAULT 0,
+    starts REAL, expires REAL, active INTEGER NOT NULL DEFAULT 1, created REAL, batch TEXT);
+CREATE TABLE IF NOT EXISTS promo_uses(code TEXT NOT NULL, user_id INTEGER NOT NULL, at REAL NOT NULL,
+    PRIMARY KEY(code, user_id));
+CREATE TABLE IF NOT EXISTS payments(charge_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, stars INTEGER NOT NULL,
+    coins INTEGER NOT NULL, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS purchases(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+    bot_id INTEGER NOT NULL, item TEXT NOT NULL, qty INTEGER NOT NULL, cost INTEGER NOT NULL, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS fsm(key TEXT PRIMARY KEY, state TEXT, data TEXT NOT NULL DEFAULT '{}', updated REAL NOT NULL);
+"""
 
 
 def init():
-    with _conn() as c:
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS hosts(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                username TEXT,
-                token TEXT NOT NULL,
-                entry TEXT,
-                autorun INTEGER NOT NULL DEFAULT 1,
-                want_running INTEGER NOT NULL DEFAULT 0,
-                created REAL NOT NULL
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users(
-                user_id INTEGER PRIMARY KEY,
-                promo_until REAL NOT NULL DEFAULT 0,
-                promo_code TEXT,
-                max_bots INTEGER NOT NULL DEFAULT 0,
-                ai_daily INTEGER NOT NULL DEFAULT 0,
-                note TEXT,
-                blocked INTEGER NOT NULL DEFAULT 0,
-                last_seen REAL NOT NULL DEFAULT 0,
-                created REAL NOT NULL
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS broadcasts(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                admin_id INTEGER NOT NULL,
-                audience TEXT NOT NULL,
-                preview TEXT NOT NULL DEFAULT '',
-                total INTEGER NOT NULL DEFAULT 0,
-                sent INTEGER NOT NULL DEFAULT 0,
-                blocked INTEGER NOT NULL DEFAULT 0,
-                failed INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'running',
-                created REAL NOT NULL,
-                finished REAL NOT NULL DEFAULT 0
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ai_usage(
-                user_id INTEGER NOT NULL,
-                day TEXT NOT NULL,
-                count INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY(user_id, day)
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS secrets(
-                host_id INTEGER NOT NULL,
-                key TEXT NOT NULL,
-                value TEXT NOT NULL,
-                updated REAL NOT NULL,
-                PRIMARY KEY(host_id, key)
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS promo(
-                code TEXT PRIMARY KEY,
-                days INTEGER NOT NULL DEFAULT 0,
-                max_uses INTEGER NOT NULL DEFAULT 0,
-                uses INTEGER NOT NULL DEFAULT 0,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_by INTEGER NOT NULL DEFAULT 0,
-                created REAL NOT NULL
-            )
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS backups(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                path TEXT NOT NULL,
-                size INTEGER NOT NULL DEFAULT 0,
-                kind TEXT NOT NULL DEFAULT 'auto',
-                info TEXT,
-                created REAL NOT NULL
-            )
-            """
-        )
-        c.execute(
-            "CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY, added_by INTEGER, created REAL)"
-        )
-        c.execute("CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        c.execute("CREATE TABLE IF NOT EXISTS promo_redemptions(user_id INTEGER, code TEXT, created REAL, PRIMARY KEY(user_id,code))")
-        _migrate(c)
-        # Standart promo kod: hamma limitni ochadi
-        c.execute(
-            "INSERT OR IGNORE INTO promo(code, days, max_uses, uses, active, created_by, created) "
-            "VALUES('infinix-host-no-limit', 0, 0, 0, 1, 0, ?)",
-            (time.time(),),
-        )
+    with conn() as c:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.executescript(SCHEMA)
+        c.execute("DELETE FROM fsm WHERE updated < ?", (time.time() - 7 * 86400,))
+    _CACHE.clear()
 
 
-# ----------------------------- botlar -----------------------------
-def add_host(owner_id, token, name, username, git_repo=None, git_branch=None):
-    with _conn() as c:
-        cur = c.execute(
-            "INSERT INTO hosts(owner_id, name, username, token, created, git_repo, git_branch) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (owner_id, name, username, token, time.time(), git_repo, git_branch),
-        )
-        return cur.lastrowid
+# ----------------------------- sozlamalar -----------------------------
+DEFAULTS = {
+    "currency_name": "Tanga", "currency_symbol": "🪙", "coins_per_star": 1,
+    "price_inline": 5, "price_reply": 3, "price_channel": 10,
+    "base_inline": 2, "base_reply": 6, "base_channels": 1,
+    "cap_inline": 20, "cap_reply": 50, "cap_channels": 10,
+    "max_bots": 3, "topup_packages": "10,50,100,500", "topup_max": 10000,
+}
+_CACHE = {}
 
 
-def get_host(host_id):
-    with _conn() as c:
-        return c.execute("SELECT * FROM hosts WHERE id=?", (host_id,)).fetchone()
+def get_s(key):
+    if key in _CACHE:
+        return _CACHE[key]
+    d = DEFAULTS[key]
+    with conn() as c:
+        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    v = d
+    if r is not None:
+        try:
+            v = int(r["value"]) if isinstance(d, int) else r["value"]
+        except ValueError:
+            v = d
+    _CACHE[key] = v
+    return v
 
 
-def user_hosts(owner_id):
-    with _conn() as c:
-        return c.execute(
-            "SELECT * FROM hosts WHERE owner_id=? ORDER BY id", (owner_id,)
-        ).fetchall()
+def set_s(key, val):
+    with conn() as c:
+        c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                  (key, str(val)))
+    _CACHE.pop(key, None)
 
 
-def all_hosts():
-    with _conn() as c:
-        return c.execute("SELECT * FROM hosts ORDER BY id").fetchall()
+def cur():
+    """(valyuta nomi, belgisi)"""
+    return get_s("currency_name"), get_s("currency_symbol")
 
 
-def host_by_token(token):
-    with _conn() as c:
-        return c.execute("SELECT * FROM hosts WHERE token=?", (token,)).fetchone()
+def money(n):
+    return f"{n} {get_s('currency_symbol')}"
 
 
-def update_host(host_id, **fields):
-    bad = set(fields) - _FIELDS
-    if bad:
-        raise ValueError(f"Noma'lum maydon: {bad}")
-    if not fields:
-        return
-    sets = ", ".join(f"{k}=?" for k in fields)
-    with _conn() as c:
-        c.execute(f"UPDATE hosts SET {sets} WHERE id=?", (*fields.values(), host_id))
+def packages():
+    out = []
+    for p in str(get_s("topup_packages")).split(","):
+        p = p.strip()
+        if p.isdigit() and 1 <= int(p) <= get_s("topup_max"):
+            out.append(int(p))
+    return out
 
 
-def delete_host(host_id):
-    with _conn() as c:
-        c.execute("DELETE FROM hosts WHERE id=?", (host_id,))
-        c.execute("DELETE FROM secrets WHERE host_id=?", (host_id,))
+# Do'kon mahsulotlari: bot darajasida limitni oshiradi
+ITEMS = {
+    "inline": dict(col="extra_inline", price="price_inline", base="base_inline", cap="cap_inline",
+                   title="🔘 Inline tugma (har bir xabarga)"),
+    "reply": dict(col="extra_reply", price="price_reply", base="base_reply", cap="cap_reply",
+                  title="⌨️ Pastki tugma"),
+    "channel": dict(col="extra_channels", price="price_channel", base="base_channels", cap="cap_channels",
+                    title="📢 Majburiy obuna kanali"),
+}
 
 
-def count_hosts(owner_id=None):
-    with _conn() as c:
-        if owner_id is None:
-            return c.execute("SELECT COUNT(*) FROM hosts").fetchone()[0]
-        return c.execute("SELECT COUNT(*) FROM hosts WHERE owner_id=?", (owner_id,)).fetchone()[0]
+def limit(b, item):
+    it = ITEMS[item]
+    return min(get_s(it["cap"]), get_s(it["base"]) + b[it["col"]])
 
 
-# ----------------------------- maxfiy kalitlar -----------------------------
-def set_secret(host_id, key, value):
-    with _conn() as c:
-        c.execute(
-            "INSERT INTO secrets(host_id, key, value, updated) VALUES(?,?,?,?) "
-            "ON CONFLICT(host_id,key) DO UPDATE SET value=excluded.value, updated=excluded.updated",
-            (host_id, key, value, time.time()),
-        )
+def limits(b):
+    return {k: limit(b, k) for k in ITEMS}
 
 
-def del_secret(host_id, key):
-    with _conn() as c:
-        return c.execute("DELETE FROM secrets WHERE host_id=? AND key=?", (host_id, key)).rowcount
+def buy(user_id, bot_id, item, qty):
+    """Atomik xarid. (holat, narx): ok | nofunds | cap | unavailable | nobot"""
+    it = ITEMS.get(item)
+    if not it or qty < 1:
+        return "unavailable", 0
+    price = get_s(it["price"])
+    cap, base = get_s(it["cap"]), get_s(it["base"])
+    if price <= 0:
+        return "unavailable", 0
+    with conn(tx=True) as c:
+        b = c.execute("SELECT * FROM bots WHERE id=?", (bot_id,)).fetchone()
+        if not b:
+            return "nobot", 0
+        if base + b[it["col"]] + qty > cap:
+            return "cap", 0
+        cost = price * qty
+        u = c.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not u or u["balance"] < cost:
+            return "nofunds", cost
+        c.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (cost, user_id))
+        c.execute(f"UPDATE bots SET {it['col']}={it['col']}+? WHERE id=?", (qty, bot_id))
+        c.execute("INSERT INTO purchases(user_id,bot_id,item,qty,cost,at) VALUES(?,?,?,?,?,?)",
+                  (user_id, bot_id, item, qty, cost, time.time()))
+        return "ok", cost
 
 
-def list_secrets(host_id):
-    with _conn() as c:
-        return c.execute("SELECT * FROM secrets WHERE host_id=? ORDER BY key", (host_id,)).fetchall()
-
-
-def clear_secrets(host_id):
-    with _conn() as c:
-        c.execute("DELETE FROM secrets WHERE host_id=?", (host_id,))
-
-
-# ----------------------------- foydalanuvchilar -----------------------------
-def ensure_user(user_id):
-    """Foydalanuvchini yaratadi; yozgan bo'lsa «bloklagan» belgisini olib tashlaydi."""
+# ----------------------------- asosiy bot foydalanuvchilari -----------------------------
+def upsert_user(u):
     now = time.time()
-    with _conn() as c:
-        c.execute("INSERT OR IGNORE INTO users(user_id, created) VALUES(?,?)", (user_id, now))
-        c.execute("UPDATE users SET last_seen=?, blocked=0 WHERE user_id=?", (now, user_id))
-
-
-def get_user(user_id):
-    with _conn() as c:
-        return c.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-
-
-def set_user(user_id, **fields):
-    bad = set(fields) - _USER_FIELDS
-    if bad:
-        raise ValueError(f"Noma'lum maydon: {bad}")
-    ensure_user(user_id)
-    if not fields:
-        return
-    sets = ", ".join(f"{k}=?" for k in fields)
-    with _conn() as c:
-        c.execute(f"UPDATE users SET {sets} WHERE user_id=?", (*fields.values(), user_id))
-
-
-def all_users():
-    with _conn() as c:
-        return c.execute("SELECT * FROM users ORDER BY created DESC").fetchall()
-
-
-def known_user_ids():
-    """Foydalanuvchi ID'lari: users jadvali + bot egalari."""
-    ids = set()
-    with _conn() as c:
-        for r in c.execute("SELECT user_id FROM users"):
-            ids.add(r[0])
-        for r in c.execute("SELECT DISTINCT owner_id FROM hosts"):
-            ids.add(r[0])
-    return ids
-
-
-# ----------------------------- AI sarfi -----------------------------
-def today():
-    return time.strftime("%Y-%m-%d", time.gmtime())
-
-
-def ai_used(user_id, day=None):
-    day = day or today()
-    with _conn() as c:
-        row = c.execute(
-            "SELECT count FROM ai_usage WHERE user_id=? AND day=?", (user_id, day)
-        ).fetchone()
-        return row[0] if row else 0
-
-
-def ai_inc(user_id, day=None):
-    day = day or today()
-    with _conn() as c:
+    with conn() as c:
         c.execute(
-            "INSERT INTO ai_usage(user_id, day, count) VALUES(?,?,1) "
-            "ON CONFLICT(user_id,day) DO UPDATE SET count=count+1",
-            (user_id, day),
-        )
-        return c.execute(
-            "SELECT count FROM ai_usage WHERE user_id=? AND day=?", (user_id, day)
-        ).fetchone()[0]
+            "INSERT INTO users(user_id,name,username,joined,last_seen) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, username=excluded.username, "
+            "last_seen=excluded.last_seen, active=1",
+            (u.id, (u.full_name or "")[:64], u.username, now, now))
+        return c.execute("SELECT * FROM users WHERE user_id=?", (u.id,)).fetchone()
 
 
-def ai_refund(user_id, day=None):
-    """Muvaffaqiyatsiz so'rov kvotasini qaytaradi (0 dan pastga tushmaydi)."""
-    day = day or today()
-    with _conn() as c:
-        c.execute(
-            "UPDATE ai_usage SET count=count-1 WHERE user_id=? AND day=? AND count>0",
-            (user_id, day),
-        )
+def get_user(uid):
+    with conn() as c:
+        return c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
 
 
-# ----------------------------- promo -----------------------------
-def get_promo(code):
-    with _conn() as c:
-        return c.execute("SELECT * FROM promo WHERE code=?", (code,)).fetchone()
+def set_ban(uid, flag):
+    with conn() as c:
+        c.execute("UPDATE users SET banned=? WHERE user_id=?", (1 if flag else 0, uid))
 
 
-def list_promos():
-    with _conn() as c:
-        return c.execute("SELECT * FROM promo ORDER BY created DESC").fetchall()
+def add_balance(uid, delta):
+    """Balansni o'zgartiradi (0 dan pastga tushmaydi). Yangi balans yoki None (foydalanuvchi yo'q)."""
+    with conn(tx=True) as c:
+        u = c.execute("SELECT balance FROM users WHERE user_id=?", (uid,)).fetchone()
+        if not u:
+            return None
+        nb = max(0, u["balance"] + delta)
+        c.execute("UPDATE users SET balance=? WHERE user_id=?", (nb, uid))
+        return nb
 
 
-def add_promo(code, days=0, max_uses=0, created_by=0):
-    with _conn() as c:
-        c.execute(
-            "INSERT INTO promo(code, days, max_uses, uses, active, created_by, created) "
-            "VALUES(?,?,?,0,1,?,?) ON CONFLICT(code) DO UPDATE SET active=1",
-            (code, days, max_uses, created_by, time.time()),
-        )
+def user_ids(active_only=True):
+    with conn() as c:
+        q = "SELECT user_id FROM users" + (" WHERE active=1 AND banned=0" if active_only else "")
+        return [r[0] for r in c.execute(q)]
 
 
-def use_promo(code):
-    with _conn() as c:
-        c.execute("UPDATE promo SET uses=uses+1 WHERE code=?", (code,))
+def mark_inactive(uid):
+    with conn() as c:
+        c.execute("UPDATE users SET active=0 WHERE user_id=?", (uid,))
 
 
-def set_promo_active(code, active):
-    with _conn() as c:
-        c.execute("UPDATE promo SET active=? WHERE code=?", (1 if active else 0, code))
+def credit_payment(charge_id, uid, stars, coins):
+    """To'lovni bir marta hisoblaydi. True — yangi to'lov."""
+    with conn(tx=True) as c:
+        try:
+            c.execute("INSERT INTO payments(charge_id,user_id,stars,coins,at) VALUES(?,?,?,?,?)",
+                      (charge_id, uid, stars, coins, time.time()))
+        except sqlite3.IntegrityError:
+            return False
+        c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (coins, uid))
+        return True
 
 
-def delete_promo(code):
-    with _conn() as c:
-        return c.execute("DELETE FROM promo WHERE code=?", (code,)).rowcount
-
-
-# ----------------------------- adminlar -----------------------------
-def add_admin(user_id, added_by=0):
-    with _conn() as c:
-        c.execute(
-            "INSERT OR IGNORE INTO admins(user_id, added_by, created) VALUES(?,?,?)",
-            (user_id, added_by, time.time()),
-        )
-
-
-def del_admin(user_id):
-    with _conn() as c:
-        return c.execute("DELETE FROM admins WHERE user_id=?", (user_id,)).rowcount
-
-
-def list_admins():
-    with _conn() as c:
-        return [r[0] for r in c.execute("SELECT user_id FROM admins ORDER BY created")]
-
-
-# ----------------------------- zaxiralar -----------------------------
-def add_backup(path, size, kind="auto", info=""):
-    with _conn() as c:
-        cur = c.execute(
-            "INSERT INTO backups(path, size, kind, info, created) VALUES(?,?,?,?,?)",
-            (path, size, kind, info, time.time()),
-        )
-        return cur.lastrowid
-
-
-def list_backups(limit=15):
-    with _conn() as c:
-        return c.execute("SELECT * FROM backups ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-
-
-def get_backup(backup_id):
-    with _conn() as c:
-        return c.execute("SELECT * FROM backups WHERE id=?", (backup_id,)).fetchone()
-
-
-def delete_backup(backup_id):
-    with _conn() as c:
-        c.execute("DELETE FROM backups WHERE id=?", (backup_id,))
-
-
-def prune_backups(keep=30):
-    rows = list_backups(500)
-    for r in rows[keep:]:
-        delete_backup(r["id"])
-
-
-# ----------------------------- kv sozlamalar -----------------------------
-def kv_get(key, default=None):
-    with _conn() as c:
-        row = c.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
-        return row[0] if row else default
-
-
-def kv_set(key, value):
-    with _conn() as c:
-        c.execute(
-            "INSERT INTO kv(key, value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, "" if value is None else str(value)),
-        )
-
-
-def backup_channel():
-    v = kv_get("backup_channel", "")
-    try:
-        return int(v) if v else None
-    except ValueError:
-        return None
-
-
-def set_backup_channel(chat_id, title=""):
-    kv_set("backup_channel", chat_id)
-    if title:
-        kv_set("backup_channel_title", title)
-
-
-def backup_channel_title():
-    return kv_get("backup_channel_title", "")
-
-
-def last_backup_day():
-    return kv_get("backup_last_day", "")
-
-
-def set_last_backup_day(day):
-    kv_set("backup_last_day", day)
-
-
-def redeem_promo(user_id, code):
-    with _conn() as c:
-        c.execute('BEGIN IMMEDIATE')
-        p = c.execute('SELECT * FROM promo WHERE code=?', (code,)).fetchone()
-        if not p or not p['active']:
-            return False, 'Kod topilmadi yoki o‘chirilgan.'
-        if c.execute('SELECT 1 FROM promo_redemptions WHERE user_id=? AND code=?', (user_id, code)).fetchone():
-            return False, 'Bu kodni avval ishlatgansiz.'
-        if p['max_uses'] and p['uses'] >= p['max_uses']:
-            return False, 'Kodning ishlatish limiti tugagan.'
-        now = time.time()
-        row = c.execute('SELECT promo_until FROM users WHERE user_id=?', (user_id,)).fetchone()
-        old = row[0] if row else 0
-        until = -1 if p['days'] == 0 or old < 0 else max(old, now) + p['days'] * 86400
-        c.execute('INSERT OR IGNORE INTO users(user_id, created) VALUES(?,?)', (user_id, now))
-        c.execute('UPDATE users SET promo_until=?,promo_code=? WHERE user_id=?', (until, code, user_id))
-        c.execute('INSERT INTO promo_redemptions VALUES(?,?,?)', (user_id, code, now))
-        c.execute('UPDATE promo SET uses=uses+1 WHERE code=?', (code,))
-        return True, ('Botlar soni va kunlik AI kvotasi cheksiz (doimiy).' if until < 0 else
-                      f'Promo yoqildi: {p["days"]} kun qo‘shildi. Botlar soni va kunlik AI kvotasi cheksiz.')
-
-
-# ----------------------------- auditoriya va broadcast -----------------------------
-AUDIENCES = ("all", "owners", "promo", "admins")
-
-
-def set_blocked(user_id, blocked=True):
-    with _conn() as c:
-        c.execute("INSERT OR IGNORE INTO users(user_id, created) VALUES(?,?)", (user_id, time.time()))
-        c.execute("UPDATE users SET blocked=? WHERE user_id=?", (1 if blocked else 0, user_id))
-
-
-def audience_ids(kind, extra=()):
-    """Broadcast qabul qiluvchilari (bloklaganlar chiqarib tashlanadi; adminlar bundan mustasno).
-
-    all    — barcha ma'lum foydalanuvchilar + extra (ALLOWED_USERS)
-    owners — kamida bitta boti borlar
-    promo  — faol promoli foydalanuvchilar
-    admins — adminlar + extra
-    """
-    now = time.time()
-    with _conn() as c:
-        blocked = {r[0] for r in c.execute("SELECT user_id FROM users WHERE blocked=1")}
-        if kind == "owners":
-            ids = {r[0] for r in c.execute("SELECT DISTINCT owner_id FROM hosts")}
-        elif kind == "promo":
-            ids = {r[0] for r in c.execute(
-                "SELECT user_id FROM users WHERE promo_until<0 OR promo_until>?", (now,))}
-        elif kind == "admins":
-            ids = {r[0] for r in c.execute("SELECT user_id FROM admins")} | set(extra)
-            return sorted(ids)
-        else:
-            ids = {r[0] for r in c.execute("SELECT user_id FROM users")}
-            ids |= {r[0] for r in c.execute("SELECT DISTINCT owner_id FROM hosts")}
-            ids |= set(extra)
-    return sorted(ids - blocked)
-
-
-def user_stats():
-    now = time.time()
-    with _conn() as c:
-        one = lambda q, *a: c.execute(q, a).fetchone()[0]
+def master_stats():
+    with conn() as c:
+        q = lambda s, *a: c.execute(s, a).fetchone()[0]  # noqa: E731
+        day = util.midnight_ts()
         return {
-            "users": one("SELECT COUNT(*) FROM users"),
-            "blocked": one("SELECT COUNT(*) FROM users WHERE blocked=1"),
-            "active_day": one("SELECT COUNT(*) FROM users WHERE last_seen>?", now - 86400),
-            "active_week": one("SELECT COUNT(*) FROM users WHERE last_seen>?", now - 7 * 86400),
-            "hosts": one("SELECT COUNT(*) FROM hosts"),
-            "owners": one("SELECT COUNT(DISTINCT owner_id) FROM hosts"),
-            "promo": one("SELECT COUNT(*) FROM users WHERE promo_until<0 OR promo_until>?", now),
+            "users": q("SELECT COUNT(*) FROM users"), "today": q("SELECT COUNT(*) FROM users WHERE joined>=?", day),
+            "banned": q("SELECT COUNT(*) FROM users WHERE banned=1"),
+            "bots": q("SELECT COUNT(*) FROM bots"), "bots_on": q("SELECT COUNT(*) FROM bots WHERE active=1"),
+            "cusers": q("SELECT COUNT(*) FROM cusers"),
+            "stars": q("SELECT COALESCE(SUM(stars),0) FROM payments"), "payments": q("SELECT COUNT(*) FROM payments"),
+            "spent": q("SELECT COALESCE(SUM(cost),0) FROM purchases"),
+            "promos": q("SELECT COUNT(*) FROM promos"), "promo_uses": q("SELECT COUNT(*) FROM promo_uses"),
         }
 
 
-def add_broadcast(admin_id, audience, preview, total):
-    with _conn() as c:
-        cur = c.execute(
-            "INSERT INTO broadcasts(admin_id, audience, preview, total, created) VALUES(?,?,?,?,?)",
-            (admin_id, audience, (preview or "")[:200], total, time.time()),
-        )
-        return cur.lastrowid
+# ----------------------------- yaratilgan botlar -----------------------------
+def add_bot(bid, owner, token, username, name):
+    with conn() as c:
+        c.execute("INSERT INTO bots(id,owner_id,token,username,name,created) VALUES(?,?,?,?,?,?)",
+                  (bid, owner, token, username, name, time.time()))
 
 
-def update_broadcast(bid, **fields):
-    allowed = {"sent", "blocked", "failed", "status", "finished", "total"}
-    bad = set(fields) - allowed
-    if bad:
-        raise ValueError(f"Noma'lum maydon: {bad}")
-    if not fields:
+def get_bot(bid):
+    with conn() as c:
+        return c.execute("SELECT * FROM bots WHERE id=?", (bid,)).fetchone()
+
+
+def bots_of(owner):
+    with conn() as c:
+        return c.execute("SELECT * FROM bots WHERE owner_id=? ORDER BY created", (owner,)).fetchall()
+
+
+def all_bots(offset=0, limit=1000):
+    with conn() as c:
+        return c.execute("SELECT * FROM bots ORDER BY created LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+
+
+def count_bots(owner=None):
+    with conn() as c:
+        if owner is None:
+            return c.execute("SELECT COUNT(*) FROM bots").fetchone()[0]
+        return c.execute("SELECT COUNT(*) FROM bots WHERE owner_id=?", (owner,)).fetchone()[0]
+
+
+_BOT_FIELDS = {"token", "username", "name", "active", "extra_inline", "extra_reply", "extra_channels", "start_cid",
+               "sub_cid", "join_text", "check_text", "join_style", "check_style"}
+
+
+def update_bot(bid, **f):
+    f = {k: v for k, v in f.items() if k in _BOT_FIELDS}
+    if not f:
         return
-    sets = ", ".join(f"{k}=?" for k in fields)
-    with _conn() as c:
-        c.execute(f"UPDATE broadcasts SET {sets} WHERE id=?", (*fields.values(), bid))
+    with conn() as c:
+        c.execute(f"UPDATE bots SET {', '.join(k + '=?' for k in f)} WHERE id=?", (*f.values(), bid))
 
 
-def list_broadcasts(limit=10):
-    with _conn() as c:
-        return c.execute("SELECT * FROM broadcasts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+def delete_bot(bid):
+    with conn(tx=True) as c:
+        cids = [r[0] for r in c.execute("SELECT id FROM contents WHERE bot_id=?", (bid,))]
+        for cid in cids:
+            c.execute("DELETE FROM ibuttons WHERE content_id=?", (cid,))
+        for t in ("contents", "rbuttons", "commands", "channels", "cusers"):
+            c.execute(f"DELETE FROM {t} WHERE bot_id=?", (bid,))
+        c.execute("DELETE FROM bots WHERE id=?", (bid,))
 
 
-def get_broadcast(bid):
-    with _conn() as c:
-        return c.execute("SELECT * FROM broadcasts WHERE id=?", (bid,)).fetchone()
+def create_bot_with_defaults(bid, owner, token, username, name):
+    """Botni va standart /start, majburiy obuna xabarlarini yaratadi."""
+    add_bot(bid, owner, token, username, name)
+    start = add_content(bid, dict(type="text", html="👋 Salom, %name%!\n\nBotimizga xush kelibsiz.", file_id=None,
+                                  file_uid=None, spoiler=0))
+    sub = add_content(bid, dict(type="text", html="❗️ Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling "
+                                                  "va «Tekshirish» tugmasini bosing:", file_id=None, file_uid=None,
+                                spoiler=0))
+    update_bot(bid, start_cid=start, sub_cid=sub)
+    return get_bot(bid)
+
+
+# ----------------------------- xabarlar (kontent) va inline tugmalar -----------------------------
+def add_content(bot_id, d):
+    with conn() as c:
+        cur_ = c.execute("INSERT INTO contents(bot_id,type,html,file_id,file_uid,spoiler,created) VALUES(?,?,?,?,?,?,?)",
+                         (bot_id, d["type"], d.get("html", ""), d.get("file_id"), d.get("file_uid"),
+                          int(d.get("spoiler", 0)), time.time()))
+        return cur_.lastrowid
+
+
+def get_content(cid):
+    with conn() as c:
+        return c.execute("SELECT * FROM contents WHERE id=?", (cid,)).fetchone()
+
+
+def replace_content(cid, d):
+    with conn() as c:
+        c.execute("UPDATE contents SET type=?, html=?, file_id=?, file_uid=?, spoiler=? WHERE id=?",
+                  (d["type"], d.get("html", ""), d.get("file_id"), d.get("file_uid"), int(d.get("spoiler", 0)), cid))
+
+
+def delete_content(cid):
+    with conn() as c:
+        c.execute("DELETE FROM ibuttons WHERE content_id=?", (cid,))
+        c.execute("DELETE FROM contents WHERE id=?", (cid,))
+
+
+def _place(c, table, col, val, new_row, maxn):
+    rows = c.execute(f"SELECT rw, COUNT(*) n FROM {table} WHERE {col}=? GROUP BY rw ORDER BY rw", (val,)).fetchall()
+    if not rows:
+        return 0, 0
+    last = rows[-1]
+    if new_row or last["n"] >= maxn:
+        return last["rw"] + 1, 0
+    return last["rw"], last["n"]
+
+
+def ibuttons(cid):
+    with conn() as c:
+        return c.execute("SELECT * FROM ibuttons WHERE content_id=? ORDER BY rw, pos, id", (cid,)).fetchall()
+
+
+def count_ibuttons(cid):
+    with conn() as c:
+        return c.execute("SELECT COUNT(*) FROM ibuttons WHERE content_id=?", (cid,)).fetchone()[0]
+
+
+def add_ibutton(cid, text, kind, value, style, new_row=True):
+    with conn(tx=True) as c:
+        rw, pos = _place(c, "ibuttons", "content_id", cid, new_row, 8)
+        return c.execute("INSERT INTO ibuttons(content_id,rw,pos,text,kind,value,style) VALUES(?,?,?,?,?,?,?)",
+                         (cid, rw, pos, text, kind, value, style)).lastrowid
+
+
+def get_ibutton(iid):
+    with conn() as c:
+        return c.execute("SELECT * FROM ibuttons WHERE id=?", (iid,)).fetchone()
+
+
+def update_ibutton(iid, **f):
+    f = {k: v for k, v in f.items() if k in ("text", "kind", "value", "style")}
+    if f:
+        with conn() as c:
+            c.execute(f"UPDATE ibuttons SET {', '.join(k + '=?' for k in f)} WHERE id=?", (*f.values(), iid))
+
+
+def del_ibutton(iid):
+    with conn() as c:
+        c.execute("DELETE FROM ibuttons WHERE id=?", (iid,))
+
+
+# ----------------------------- pastki (reply) tugmalar, buyruqlar -----------------------------
+def rbuttons(bot_id):
+    with conn() as c:
+        return c.execute("SELECT * FROM rbuttons WHERE bot_id=? ORDER BY rw, pos, id", (bot_id,)).fetchall()
+
+
+def get_rbutton(rid):
+    with conn() as c:
+        return c.execute("SELECT * FROM rbuttons WHERE id=?", (rid,)).fetchone()
+
+
+def rbutton_by_text(bot_id, text):
+    with conn() as c:
+        return c.execute("SELECT * FROM rbuttons WHERE bot_id=? AND text=?", (bot_id, text)).fetchone()
+
+
+def add_rbutton(bot_id, text, style, content_id, new_row=True):
+    with conn(tx=True) as c:
+        rw, pos = _place(c, "rbuttons", "bot_id", bot_id, new_row, 4)
+        return c.execute("INSERT INTO rbuttons(bot_id,rw,pos,text,style,content_id) VALUES(?,?,?,?,?,?)",
+                         (bot_id, rw, pos, text, style, content_id)).lastrowid
+
+
+def update_rbutton(rid, **f):
+    f = {k: v for k, v in f.items() if k in ("text", "style")}
+    if f:
+        with conn() as c:
+            c.execute(f"UPDATE rbuttons SET {', '.join(k + '=?' for k in f)} WHERE id=?", (*f.values(), rid))
+
+
+def del_rbutton(rid):
+    r = get_rbutton(rid)
+    if r:
+        delete_content(r["content_id"])
+        with conn() as c:
+            c.execute("DELETE FROM rbuttons WHERE id=?", (rid,))
+
+
+def commands(bot_id):
+    with conn() as c:
+        return c.execute("SELECT * FROM commands WHERE bot_id=? ORDER BY name", (bot_id,)).fetchall()
+
+
+def get_command(cid):
+    with conn() as c:
+        return c.execute("SELECT * FROM commands WHERE id=?", (cid,)).fetchone()
+
+
+def command_by_name(bot_id, name):
+    with conn() as c:
+        return c.execute("SELECT * FROM commands WHERE bot_id=? AND name=?", (bot_id, name)).fetchone()
+
+
+def add_command(bot_id, name, content_id):
+    with conn() as c:
+        try:
+            return c.execute("INSERT INTO commands(bot_id,name,content_id) VALUES(?,?,?)",
+                             (bot_id, name, content_id)).lastrowid
+        except sqlite3.IntegrityError:
+            return None
+
+
+def del_command(cid):
+    r = get_command(cid)
+    if r:
+        delete_content(r["content_id"])
+        with conn() as c:
+            c.execute("DELETE FROM commands WHERE id=?", (cid,))
+
+
+# ----------------------------- majburiy obuna kanallari -----------------------------
+def channels(bot_id):
+    with conn() as c:
+        return c.execute("SELECT * FROM channels WHERE bot_id=? ORDER BY id", (bot_id,)).fetchall()
+
+
+def get_channel(chid):
+    with conn() as c:
+        return c.execute("SELECT * FROM channels WHERE id=?", (chid,)).fetchone()
+
+
+def add_channel(bot_id, chat_id, title, username, url):
+    with conn() as c:
+        if c.execute("SELECT 1 FROM channels WHERE bot_id=? AND chat_id=?", (bot_id, chat_id)).fetchone():
+            return None
+        return c.execute("INSERT INTO channels(bot_id,chat_id,title,username,url) VALUES(?,?,?,?,?)",
+                         (bot_id, chat_id, title, username, url)).lastrowid
+
+
+def update_channel(chid, **f):
+    f = {k: v for k, v in f.items() if k in ("label", "url", "title")}
+    if f:
+        with conn() as c:
+            c.execute(f"UPDATE channels SET {', '.join(k + '=?' for k in f)} WHERE id=?", (*f.values(), chid))
+
+
+def del_channel(chid):
+    with conn() as c:
+        c.execute("DELETE FROM channels WHERE id=?", (chid,))
+
+
+# ----------------------------- yaratilgan bot foydalanuvchilari -----------------------------
+def cuser_touch(bot_id, u):
+    now = time.time()
+    with conn() as c:
+        c.execute(
+            "INSERT INTO cusers(bot_id,user_id,name,username,joined,last_seen) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(bot_id,user_id) DO UPDATE SET name=excluded.name, username=excluded.username, "
+            "last_seen=excluded.last_seen, active=1",
+            (bot_id, u.id, (u.full_name or "")[:64], u.username, now, now))
+        return c.execute("SELECT * FROM cusers WHERE bot_id=? AND user_id=?", (bot_id, u.id)).fetchone()
+
+
+def get_cuser(bot_id, uid):
+    with conn() as c:
+        return c.execute("SELECT * FROM cusers WHERE bot_id=? AND user_id=?", (bot_id, uid)).fetchone()
+
+
+def count_cusers(bot_id):
+    with conn() as c:
+        return c.execute("SELECT COUNT(*) FROM cusers WHERE bot_id=?", (bot_id,)).fetchone()[0]
+
+
+def cuser_ids(bot_id):
+    with conn() as c:
+        return [r[0] for r in c.execute("SELECT user_id FROM cusers WHERE bot_id=? AND active=1 AND banned=0",
+                                        (bot_id,))]
+
+
+def cuser_inactive(bot_id, uid):
+    with conn() as c:
+        c.execute("UPDATE cusers SET active=0 WHERE bot_id=? AND user_id=?", (bot_id, uid))
+
+
+def set_cban(bot_id, uid, flag):
+    with conn() as c:
+        return c.execute("UPDATE cusers SET banned=? WHERE bot_id=? AND user_id=?",
+                         (1 if flag else 0, bot_id, uid)).rowcount
+
+
+def change_cbalance(bot_id, uid, mode, amount):
+    """mode: add | set. Yangi balans yoki None (foydalanuvchi shu botda yo'q)."""
+    with conn(tx=True) as c:
+        u = c.execute("SELECT balance FROM cusers WHERE bot_id=? AND user_id=?", (bot_id, uid)).fetchone()
+        if not u:
+            return None
+        nb = max(0, amount if mode == "set" else u["balance"] + amount)
+        c.execute("UPDATE cusers SET balance=? WHERE bot_id=? AND user_id=?", (nb, bot_id, uid))
+        return nb
+
+
+def cstats(bot_id):
+    day = util.midnight_ts()
+    with conn() as c:
+        q = lambda s, *a: c.execute(s, a).fetchone()[0]  # noqa: E731
+        return {
+            "total": q("SELECT COUNT(*) FROM cusers WHERE bot_id=?", bot_id),
+            "active": q("SELECT COUNT(*) FROM cusers WHERE bot_id=? AND active=1", bot_id),
+            "banned": q("SELECT COUNT(*) FROM cusers WHERE bot_id=? AND banned=1", bot_id),
+            "today": q("SELECT COUNT(*) FROM cusers WHERE bot_id=? AND joined>=?", bot_id, day),
+            "week": q("SELECT COUNT(*) FROM cusers WHERE bot_id=? AND joined>=?", bot_id, time.time() - 7 * 86400),
+            "online": q("SELECT COUNT(*) FROM cusers WHERE bot_id=? AND last_seen>=?", bot_id, time.time() - 86400),
+        }
+
+
+# ----------------------------- promokodlar -----------------------------
+def promo_create(code, reward, max_uses, starts, expires, batch):
+    with conn() as c:
+        try:
+            c.execute("INSERT INTO promos(code,reward,max_uses,starts,expires,created,batch) VALUES(?,?,?,?,?,?,?)",
+                      (code, reward, max_uses, starts, expires, time.time(), batch))
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def promo_get(code):
+    with conn() as c:
+        return c.execute("SELECT * FROM promos WHERE code=?", (code,)).fetchone()
+
+
+def promo_list(offset=0, limit=10):
+    with conn() as c:
+        return c.execute("SELECT * FROM promos ORDER BY created DESC, code LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+
+
+def promo_count():
+    with conn() as c:
+        return c.execute("SELECT COUNT(*) FROM promos").fetchone()[0]
+
+
+def promo_batch(batch):
+    with conn() as c:
+        return c.execute("SELECT * FROM promos WHERE batch=? ORDER BY code", (batch,)).fetchall()
+
+
+def promo_toggle(code):
+    with conn() as c:
+        c.execute("UPDATE promos SET active=1-active WHERE code=?", (code,))
+
+
+def promo_delete(code):
+    with conn() as c:
+        c.execute("DELETE FROM promos WHERE code=?", (code,))
+        c.execute("DELETE FROM promo_uses WHERE code=?", (code,))
+
+
+def promo_state(p, now=None):
+    """Kod holati matni: faol | o'chirilgan | boshlanmagan | muddati o'tgan | tugagan"""
+    now = now or time.time()
+    if not p["active"]:
+        return "o'chirilgan"
+    if p["starts"] and now < p["starts"]:
+        return "boshlanmagan"
+    if p["expires"] and now > p["expires"]:
+        return "muddati o'tgan"
+    if p["max_uses"] is not None and p["used"] >= p["max_uses"]:
+        return "tugagan"
+    return "faol"
+
+
+def promo_redeem(code, uid, now=None):
+    """(holat, mukofot). holat: ok | notfound | inactive | notstarted | expired | exhausted | already"""
+    now = now or time.time()
+    with conn(tx=True) as c:
+        p = c.execute("SELECT * FROM promos WHERE code=?", (code,)).fetchone()
+        if not p:
+            return "notfound", 0
+        st = promo_state(p, now)
+        if st != "faol":
+            return {"o'chirilgan": "inactive", "boshlanmagan": "notstarted", "muddati o'tgan": "expired",
+                    "tugagan": "exhausted"}[st], 0
+        if c.execute("SELECT 1 FROM promo_uses WHERE code=? AND user_id=?", (code, uid)).fetchone():
+            return "already", 0
+        c.execute("INSERT INTO promo_uses(code,user_id,at) VALUES(?,?,?)", (code, uid, now))
+        c.execute("UPDATE promos SET used=used+1 WHERE code=?", (code,))
+        c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (p["reward"], uid))
+        return "ok", p["reward"]
