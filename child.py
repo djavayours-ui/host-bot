@@ -23,9 +23,11 @@ from storage import SqliteStorage
 from util import esc
 
 log = logging.getLogger("builder.child")
-RESERVED = {"start", "admin", "cancel", "balance", "bonus", "ref"}
+RESERVED = {"start", "admin", "cancel", "balance", "bonus", "ref", "top", "contact", "new", "random"}
 MAX_KEYWORDS = 50
-BUILTIN = {"balance", "bonus", "ref"}
+BUILTIN = {"balance", "bonus", "ref", "top", "contact", "new", "random"}
+CONTACT_WAIT = {}   # (bot_id, user_id) -> vaqt: keyingi xabar murojaat sifatida yuboriladi
+CONTACT_TTL = 600
 
 
 # ============================== umumiy yordamchilar ==============================
@@ -233,8 +235,15 @@ async def apply_referral(bot, cbot, user, arg):
 async def h_start(m: Message, bot, cbot, admin, command: CommandObject, is_new: bool = False):
     if is_new and command.args:
         await apply_referral(bot, cbot, m.from_user, command.args.strip())
+    if is_new and not admin and cbot["welcome_bonus"] > 0:
+        db.give_welcome(cbot["id"], m.from_user.id, cbot["welcome_bonus"])
+        await m.answer(f"🎁 Xush kelibsiz bonusi: <b>+{cbot['welcome_bonus']}</b>")
     if not admin and not await passes_gate(bot, cbot, m.from_user, m.chat.id):
         return
+    if cbot["kind"] == "kino" and command.args and re.fullmatch(r"k\d{1,9}", command.args.strip()):
+        import kino  # ulashilgan havola: /start k<kod> — to'g'ridan-to'g'ri kinoni ochadi
+        if await kino.deep_link(m, bot, cbot, int(command.args.strip()[1:])):
+            return
     await send_start(bot, cbot, m.from_user, m.chat.id)
     if m.from_user.id == cbot["owner_id"]:
         await m.answer("🛠 Botni sozlash paneli: /admin")
@@ -249,6 +258,11 @@ async def builtin(m: Message, cbot, name):
     """/balance, /bonus, /ref — har bir botda tayyor ishlaydigan buyruqlar."""
     cbot = db.get_bot(cbot["id"]) or cbot
     uid = m.from_user.id
+    if cbot["kind"] == "kino" and name in ("top", "new", "random"):
+        import kino
+        return await kino.lists(m, cbot, name)
+    if name in ("new", "random"):
+        return
     if name == "balance":
         cu = db.get_cuser(cbot["id"], uid)
         return await m.answer(f"💰 Balansingiz: <b>{cu['balance'] if cu else 0}</b>")
@@ -260,12 +274,78 @@ async def builtin(m: Message, cbot, name):
         if st == "wait":
             return await m.answer(f"⏳ Keyingi bonusgacha: <b>{fmt_wait(v)}</b>")
         return await m.answer("ℹ️ Kunlik bonus hozir yoqilmagan.")
+    if name == "contact":
+        if not cbot["contact_on"]:
+            return await m.answer("ℹ️ Murojaat hozir yoqilmagan.")
+        CONTACT_WAIT[(cbot["id"], uid)] = time.time()
+        return await m.answer("✉️ Xabaringizni yuboring (matn, rasm, fayl...). Egasi javob bersa, shu yerda olasiz. "
+                              "10 daqiqa ichida yuboring.")
+    if name == "top":
+        bal, refs = db.top_balances(cbot["id"], 10), db.top_referrers(cbot["id"], 10)
+        if not bal and not refs:
+            return await m.answer("🏆 Reyting hali bo'sh.")
+        who = lambda r: esc(r["name"] or r["user_id"])
+        parts = ["🏆 <b>Reyting</b>"]
+        if bal:
+            parts.append("\n💰 <b>Balans bo'yicha</b>\n" + "\n".join(f"{i}. {who(r)} — {r['balance']}" for i, r in enumerate(bal, 1)))
+        if refs:
+            parts.append("\n👥 <b>Takliflar bo'yicha</b>\n" + "\n".join(f"{i}. {who(r)} — {r['refs']}" for i, r in enumerate(refs, 1)))
+        return await m.answer("\n".join(parts))
     if name == "ref":
         cu = db.get_cuser(cbot["id"], uid)
         link = f"https://t.me/{cbot['username']}?start=ref_{uid}"
         reward = f"\nHar bir taklif uchun: <b>+{cbot['ref_reward']}</b>" if cbot["ref_reward"] else ""
         return await m.answer(f"👥 <b>Do'stlarni taklif qiling</b>\nSizning havolangiz:\n<code>{link}</code>\n"
                               f"Taklif qilinganlar: <b>{cu['refs'] if cu else 0}</b>{reward}")
+
+
+class ContactWait(Filter):
+    async def __call__(self, m: Message, cbot, admin: bool = False) -> bool:
+        if admin or not cbot["contact_on"]:
+            return False
+        key = (cbot["id"], m.from_user.id)
+        t = CONTACT_WAIT.get(key)
+        if not t or time.time() - t > CONTACT_TTL:
+            CONTACT_WAIT.pop(key, None)
+            return False
+        return not (m.text or "").startswith("/")
+
+
+class ContactReply(Filter):
+    async def __call__(self, m: Message, cbot, admin: bool = False) -> bool:
+        r = m.reply_to_message
+        return bool(admin and r and db.contact_map_get(cbot["id"], m.chat.id, r.message_id))
+
+
+@user_r.message(ContactWait())
+async def h_contact_msg(m: Message, bot, cbot):
+    """Foydalanuvchi murojaati egasiga va bot adminlariga yetkaziladi."""
+    CONTACT_WAIT.pop((cbot["id"], m.from_user.id), None)
+    u = m.from_user
+    head = (f"✉️ <b>Murojaat</b> · {esc(u.full_name)}" + (f" (@{esc(u.username)})" if u.username else "")
+            + f" · <code>{u.id}</code>\n↩️ Javob berish uchun shu xabarga (yoki pastdagi nusxasiga) reply qiling.")
+    sent = 0
+    for rid in {cbot["owner_id"], *db.bot_admins(cbot["id"])}:
+        try:
+            h = await bot.send_message(rid, head)
+            cp = await bot.copy_message(rid, m.chat.id, m.message_id, reply_to_message_id=h.message_id)
+            db.contact_map_add(cbot["id"], rid, h.message_id, u.id)
+            db.contact_map_add(cbot["id"], rid, cp.message_id, u.id)
+            sent += 1
+        except Exception:
+            pass
+    await m.answer("✅ Xabaringiz yuborildi. Javobni shu yerda olasiz." if sent
+                   else "❌ Hozir yuborib bo'lmadi, keyinroq urinib ko'ring.")
+
+
+@user_r.message(ContactReply())
+async def h_contact_reply(m: Message, bot, cbot):
+    uid = db.contact_map_get(cbot["id"], m.chat.id, m.reply_to_message.message_id)
+    try:
+        await bot.copy_message(uid, m.chat.id, m.message_id)
+        await m.answer("✅ Javob yuborildi.")
+    except Exception:
+        await m.answer("❌ Foydalanuvchiga yuborib bo'lmadi (botni bloklagan bo'lishi mumkin).")
 
 
 @user_r.message(F.text)
@@ -281,6 +361,11 @@ async def h_text(m: Message, bot, cbot, admin):
     else:
         row = db.rbutton_by_text(cbot["id"], m.text) or db.keyword_by_word(cbot["id"], t)
     if not row:
+        if cbot["kind"] == "kino" and not t.startswith("/"):  # Kino shablon: oddiy matn — qidiruv
+            if not admin and not await passes_gate(bot, cbot, m.from_user, m.chat.id):
+                return
+            import kino
+            return await kino.search(m, bot, cbot, t)
         return
     if not admin and not await passes_gate(bot, cbot, m.from_user, m.chat.id):
         return
@@ -309,6 +394,8 @@ async def h_ibtn(c: CallbackQuery, bot, cbot, admin):
         if miss:
             await c.answer("❗️ Avval kanallarga obuna bo'ling", show_alert=True)
             return await send_gate(bot, cbot, c.from_user, c.message.chat.id, miss)
+    if not admin:
+        db.ibtn_click(b["id"])
     if b["kind"] == "popup":
         return await c.answer(util.render(b["value"], ctx_of(cbot, c.from_user), "plain")[:200], show_alert=True)
     await c.answer()
@@ -339,7 +426,9 @@ def scr_home(cbot):
     text = (f"🛠 <b>{esc(cbot['name'])}</b> — boshqaruv paneli\n"
             f"👥 Foydalanuvchilar: {db.count_cusers(cbot['id'])}\n\n"
             "Pastdagi bo'limlardan birini tanlang.")
+    kino_row = [[B("🎬 Kino bazasi", "k:home")]] if cbot["kind"] == "kino" else []
     return text, M(
+        *kino_row,
         [B("📝 Start xabari", f"ce:{cbot['start_cid']}"), B("⌨️ Pastki tugmalar", "rbl")],
         [B("💬 Buyruqlar", "cml"), B("📢 Majburiy obuna", "a:sub")],
         [B("📣 Xabar yuborish", "a:bc"), B("📊 Statistika", "a:stat")],
@@ -364,6 +453,13 @@ def scr_stat(cbot):
     if refs:
         ref_txt = "\n\n🏆 <b>Eng ko'p taklif qilganlar</b>\n" + "\n".join(
             f"{i}. {esc(r['name'] or r['user_id'])} — {r['refs']}" for i, r in enumerate(refs, 1))
+    tb = db.top_buttons(cbot["id"], 5)
+    if tb:
+        ref_txt += "\n\n🖱 <b>Eng ko'p bosilgan tugmalar</b>\n" + "\n".join(
+            f"{i}. {esc(r['text'])} — {r['clicks']}" for i, r in enumerate(tb, 1))
+    if cbot["kind"] == "kino":
+        import kino
+        ref_txt += "\n" + kino.stat_line(cbot)
     return (f"📊 <b>Statistika</b>\n👥 Jami: <b>{s['total']}</b>\n✅ Faol (bloklamagan): {s['active']}\n"
             f"🆕 Bugun: {s['today']} · 7 kun: {s['week']}\n🕒 24 soatda faol: {s['online']}\n🚫 Ban: {s['banned']}\n\n"
             f"📈 <b>Oxirgi 7 kun (yangi foydalanuvchilar)</b>\n{chart}{ref_txt}",
@@ -375,11 +471,15 @@ def scr_eco(cbot):
     off = " (o'chirilgan)"
     return (f"🎁 <b>Referal va kunlik bonus</b>\n\n"
             f"👥 Taklif uchun mukofot: <b>{cbot['ref_reward']}</b>{off if not cbot['ref_reward'] else ''}\n"
-            f"🎁 Kunlik bonus: <b>{cbot['daily_bonus']}</b>{off if not cbot['daily_bonus'] else ''}\n\n"
+            f"🎁 Kunlik bonus: <b>{cbot['daily_bonus']}</b>{off if not cbot['daily_bonus'] else ''}\n"
+            f"👋 Xush kelibsiz bonusi: <b>{cbot['welcome_bonus']}</b>{off if not cbot['welcome_bonus'] else ''}\n"
+            f"✉️ Murojaat (/contact): <b>{'yoqilgan' if cbot['contact_on'] else 'o\'chiq'}</b>\n\n"
             "Foydalanuvchilar uchun tayyor buyruqlar: <code>/ref</code> — taklif havolasi, <code>/bonus</code> — kunlik bonus, "
             "<code>/balance</code> — balans. Xabar matnida <code>%ref_link%</code> va <code>%referrals%</code> ishlaydi.\n"
             "Mukofot 0 bo'lsa — o'chirilgan (referal hisoblanadi, lekin balans berilmaydi).",
             M([B("✏️ Taklif mukofoti", "a:refr"), B("✏️ Kunlik bonus", "a:dbon")],
+              [B("✏️ Xush kelibsiz bonusi", "a:wbon"),
+               B("✉️ Murojaat: " + ("o'chirish" if cbot["contact_on"] else "yoqish"), "a:ctc")],
               [B("⬅️ Orqaga", "a:home")]))
 
 
@@ -702,6 +802,12 @@ async def r_a(x):
     if sub == "dbon":
         return await ask(x.c, x.state, "eco_bonus", "🎁 Kunlik bonus miqdorini yuboring "
                                                     "(0 — o'chirish, maks. 1 000 000):", "a:eco")
+    if sub == "wbon":
+        return await ask(x.c, x.state, "eco_welcome", "👋 Yangi foydalanuvchiga beriladigan bonusni yuboring "
+                                                      "(0 — o'chirish, maks. 1 000 000):", "a:eco")
+    if sub == "ctc":
+        db.update_bot(x.cbot["id"], contact_on=0 if x.cbot["contact_on"] else 1)
+        return await show(x.c, *scr_eco(x.cbot))
     if sub == "adm":
         if not is_owner_level(x.cbot, x.user.id):
             return await x.c.answer("Adminlarni faqat bot egasi boshqaradi", show_alert=True)
@@ -1424,6 +1530,18 @@ async def a_eco_bonus(m, state, d, bot, cbot):
     await say(m, d, "✅ Saqlandi.\n\n" + text, reply_markup=kb)
 
 
+@answer("eco_welcome")
+async def a_eco_welcome(m, state, d, bot, cbot):
+    try:
+        v = util.parse_int(m.text, 0, 1_000_000)
+    except ValueError:
+        return await say(m, d, "❌ 0 dan 1 000 000 gacha butun son yuboring.")
+    db.update_bot(cbot["id"], welcome_bonus=v)
+    await state.clear()
+    text, kb = scr_eco(cbot)
+    await say(m, d, "✅ Saqlandi.\n\n" + text, reply_markup=kb)
+
+
 # ---- foydalanuvchilar eksporti ----
 async def export_users(x):
     rows = db.cusers_export(x.cbot["id"])
@@ -1572,3 +1690,6 @@ ROUTES = {
     "bcgo": r_bcgo, "bcx": r_bcx, "kwl": r_kwl, "kw": r_kw, "kw+": r_kw_add, "kwd": r_kwd, "kwdo": r_kwdo,
     "adm": r_adm, "adm+": r_adm_add, "admd": r_admd,
 }
+
+
+import kino  # noqa: E402,F401  (Kino shabloni: yo'nalishlar va handlerlarni ro'yxatdan o'tkazadi)

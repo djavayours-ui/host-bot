@@ -85,6 +85,16 @@ CREATE TABLE IF NOT EXISTS keywords(
     id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER NOT NULL, word TEXT NOT NULL, content_id INTEGER NOT NULL,
     UNIQUE(bot_id, word));
 CREATE INDEX IF NOT EXISTS kw_bot ON keywords(bot_id);
+CREATE TABLE IF NOT EXISTS contact_map(bot_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, msg_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL, at REAL, PRIMARY KEY(bot_id, chat_id, msg_id));
+CREATE TABLE IF NOT EXISTS kino_titles(
+    bot_id INTEGER NOT NULL, tag TEXT NOT NULL, code INTEGER NOT NULL, title TEXT NOT NULL,
+    search TEXT NOT NULL DEFAULT '', views INTEGER NOT NULL DEFAULT 0, created REAL, PRIMARY KEY(bot_id, tag));
+CREATE UNIQUE INDEX IF NOT EXISTS kt_code ON kino_titles(bot_id, code);
+CREATE TABLE IF NOT EXISTS kino_posts(
+    bot_id INTEGER NOT NULL, msg_id INTEGER NOT NULL, tag TEXT NOT NULL, kind TEXT, at REAL,
+    PRIMARY KEY(bot_id, msg_id));
+CREATE INDEX IF NOT EXISTS kp_tag ON kino_posts(bot_id, tag);
 CREATE TABLE IF NOT EXISTS bot_admins(bot_id INTEGER NOT NULL, user_id INTEGER NOT NULL, added REAL,
     PRIMARY KEY(bot_id, user_id));
 """
@@ -96,6 +106,14 @@ MIGRATIONS = [
     ("cusers", "referrer_id", "INTEGER"),
     ("cusers", "refs", "INTEGER NOT NULL DEFAULT 0"),
     ("cusers", "last_bonus", "REAL NOT NULL DEFAULT 0"),
+    ("bots", "contact_on", "INTEGER NOT NULL DEFAULT 0"),
+    ("bots", "welcome_bonus", "INTEGER NOT NULL DEFAULT 0"),
+    ("ibuttons", "clicks", "INTEGER NOT NULL DEFAULT 0"),
+    ("bots", "kind", "TEXT NOT NULL DEFAULT 'custom'"),
+    ("bots", "kino_chat", "INTEGER"),
+    ("bots", "kino_title", "TEXT"),
+    ("bots", "kino_protect", "INTEGER NOT NULL DEFAULT 0"),
+    ("bots", "kino_footer", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 
@@ -330,21 +348,29 @@ def delete_bot(bid):
         cids = [r[0] for r in c.execute("SELECT id FROM contents WHERE bot_id=?", (bid,))]
         for cid in cids:
             c.execute("DELETE FROM ibuttons WHERE content_id=?", (cid,))
-        for t in ("contents", "rbuttons", "commands", "channels", "cusers", "keywords", "bot_admins"):
+        for t in ("contents", "rbuttons", "commands", "channels", "cusers", "keywords", "bot_admins",
+                  "contact_map", "kino_titles", "kino_posts"):
             c.execute(f"DELETE FROM {t} WHERE bot_id=?", (bid,))
         c.execute("DELETE FROM bots WHERE id=?", (bid,))
         c.execute("DELETE FROM fsm WHERE key LIKE ?", (f"{bid}:%",))
 
 
-def create_bot_with_defaults(bid, owner, token, username, name):
-    """Botni va standart /start, majburiy obuna xabarlarini yaratadi."""
+START_TEXTS = {
+    "custom": "👋 Salom, %name%!\n\nBotimizga xush kelibsiz.",
+    "kino": ("🎬 Salom, %name%!\n\nKino <b>nomini</b> yoki <b>kodini</b> yuboring — men uni topib beraman.\n\n"
+             "🔥 /top — mashhur kinolar\n🆕 /new — yangi kinolar\n🎲 /random — tasodifiy kino"),
+}
+
+
+def create_bot_with_defaults(bid, owner, token, username, name, kind="custom"):
+    """Botni va standart /start, majburiy obuna xabarlarini yaratadi. kind — shablon: custom | kino."""
     add_bot(bid, owner, token, username, name)
-    start = add_content(bid, dict(type="text", html="👋 Salom, %name%!\n\nBotimizga xush kelibsiz.", file_id=None,
+    start = add_content(bid, dict(type="text", html=START_TEXTS.get(kind, START_TEXTS["custom"]), file_id=None,
                                   file_uid=None, spoiler=0))
     sub = add_content(bid, dict(type="text", html="❗️ Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling "
                                                   "va «Tekshirish» tugmasini bosing:", file_id=None, file_uid=None,
                                 spoiler=0))
-    update_bot(bid, start_cid=start, sub_cid=sub)
+    update_bot(bid, start_cid=start, sub_cid=sub, kind=kind if kind in START_TEXTS else "custom")
     return get_bot(bid)
 
 
@@ -807,3 +833,44 @@ def raw_set(key, value):
     with conn() as c:
         c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                   (key, str(value)))
+
+
+# ----------------------------- yangi: reyting, murojaat, xush kelibsiz bonusi, tugma statistikasi -----------------------------
+_BOT_FIELDS = set(_BOT_FIELDS) | {"contact_on", "welcome_bonus", "kind", "kino_chat", "kino_title",
+                                  "kino_protect", "kino_footer"}
+
+
+def top_balances(bot_id, limit=10):
+    with conn() as c:
+        return c.execute("SELECT user_id,name,username,balance FROM cusers WHERE bot_id=? AND balance>0 AND banned=0 "
+                         "ORDER BY balance DESC, user_id LIMIT ?", (bot_id, limit)).fetchall()
+
+
+def ibtn_click(iid):
+    with conn() as c:
+        c.execute("UPDATE ibuttons SET clicks=clicks+1 WHERE id=?", (iid,))
+
+
+def top_buttons(bot_id, limit=5):
+    with conn() as c:
+        return c.execute("SELECT b.text, b.clicks FROM ibuttons b JOIN contents k ON k.id=b.content_id "
+                         "WHERE k.bot_id=? AND b.clicks>0 ORDER BY b.clicks DESC, b.id LIMIT ?", (bot_id, limit)).fetchall()
+
+
+def contact_map_add(bot_id, chat_id, msg_id, user_id):
+    with conn() as c:
+        c.execute("INSERT OR REPLACE INTO contact_map(bot_id,chat_id,msg_id,user_id,at) VALUES(?,?,?,?,?)",
+                  (bot_id, chat_id, msg_id, user_id, time.time()))
+        c.execute("DELETE FROM contact_map WHERE at < ?", (time.time() - 30 * 86400,))
+
+
+def contact_map_get(bot_id, chat_id, msg_id):
+    with conn() as c:
+        r = c.execute("SELECT user_id FROM contact_map WHERE bot_id=? AND chat_id=? AND msg_id=?",
+                      (bot_id, chat_id, msg_id)).fetchone()
+    return r["user_id"] if r else None
+
+
+def give_welcome(bot_id, uid, amount):
+    with conn() as c:
+        c.execute("UPDATE cusers SET balance=balance+? WHERE bot_id=? AND user_id=?", (amount, bot_id, uid))

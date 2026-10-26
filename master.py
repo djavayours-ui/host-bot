@@ -127,6 +127,7 @@ def scr_bot(row, is_admin=False):
     row = db.get_bot(row["id"])
     lim = db.limits(row)
     text = (f"🤖 <b>{esc(row['name'])}</b> · @{esc(row['username'])}\nHolat: {bot_status(row)}\n"
+            + ("📁 Shablon: Kino bot\n" if row["kind"] == "kino" else "") +
             f"👥 Foydalanuvchilar: {db.count_cusers(row['id'])}\n"
             f"🔘 Inline: {lim['inline']} · ⌨️ Pastki: {lim['reply']} · 📢 Kanal: {lim['channel']}\n\n"
             "Sozlash: botga kirib <code>/admin</code> yuboring.")
@@ -222,8 +223,24 @@ async def cb_new(c: CallbackQuery, state: FSMContext, is_admin):
     mx = db.get_s("max_bots")
     if not is_admin and db.count_bots(c.from_user.id) >= mx:
         return await c.answer(f"Siz maksimal {mx} ta bot yarata olasiz.", show_alert=True)
+    await state.clear()
+    await show(c, "🤖 <b>Yangi bot</b>\n\nQaysi turdagi bot yaratamiz?\n\n"
+                  "🆕 <b>Bo'sh bot</b> — o'zingiz sozlaysiz (xabarlar, tugmalar, majburiy obuna...).\n"
+                  "📁 <b>Kino bot</b> — tayyor: kino nomi/kodi bo'yicha qidiruv, qismlar, mashhur/yangi kinolar. "
+                  "Baza — Telegram kanal (nomlar <code>#kino_nomi</code> hashtagida).",
+               M([B("🆕 Bo'sh bot", "new:custom")], [B("📁 Kino bot", "new:kino")], [B("⬅️ Orqaga", "home")]))
+
+
+@router.callback_query(F.data.startswith("new:"))
+async def cb_new_tpl(c: CallbackQuery, state: FSMContext, is_admin):
+    tpl = c.data.split(":")[1]
+    if tpl not in db.START_TEXTS:
+        return await c.answer()
+    mx = db.get_s("max_bots")
+    if not is_admin and db.count_bots(c.from_user.id) >= mx:
+        return await c.answer(f"Siz maksimal {mx} ta bot yarata olasiz.", show_alert=True)
     await ask(c, state, "token", "🤖 Yangi bot tokenini yuboring.\n\nToken yo'q bo'lsa: @BotFather → /newbot → nom va "
-                                 "username kiriting → token nusxalang.", "home")
+                                 "username kiriting → token nusxalang.", "new", tpl=tpl)
 
 
 @answer("token")
@@ -247,11 +264,14 @@ async def a_token(m: Message, state, d, bot):
         return await say(m, d, f"❌ Tokenni tekshirib bo'lmadi: {esc(e)}")
     if db.get_bot(me.id):
         return await say(m, d, "❌ Bu bot allaqachon ulangan.")
-    row = db.create_bot_with_defaults(me.id, m.from_user.id, tok, me.username, me.full_name)
+    tpl = d.get("tpl", "custom")
+    row = db.create_bot_with_defaults(me.id, m.from_user.id, tok, me.username, me.full_name, tpl)
     await mgr.start_bot(row)
     await state.clear()
     await say(m, d, f"✅ <b>@{esc(me.username)}</b> yaratildi va ishga tushdi!\n\n"
-                   "Endi botga kirib <code>/start</code>, so'ng <code>/admin</code> yuboring — u yerda hamma narsani sozlaysiz.",
+                   + ("Endi botga kirib <code>/start</code>, so'ng <code>/admin</code> → «🎬 Kino bazasi» → «📡 Baza kanali» orqali "
+                    "kanalni ulang (bot kanalda admin bo'lsin), keyin «➕ Kino qo'shish»." if tpl == "kino" else
+                    "Endi botga kirib <code>/start</code>, so'ng <code>/admin</code> yuboring — u yerda hamma narsani sozlaysiz."),
                    reply_markup=M([B("🔗 Botni ochish", url=f"https://t.me/{me.username}")],
                                   [B("📂 Botlarim", "my:0"), B("⬅️ Menyu", "home")]))
 
@@ -265,7 +285,7 @@ async def cb_my(c: CallbackQuery, state: FSMContext):
     per = 8
     pages = util.pages(len(rows_), per)
     page = min(max(page, 0), pages - 1)
-    rows = [[B(f"{'🟢' if r['active'] else '⏸'} @{r['username']}", f"bot:{r['id']}")] for r in rows_[page * per:(page + 1) * per]]
+    rows = [[B(f"{'🟢' if r['active'] else '⏸'} {'📁 ' if r['kind'] == 'kino' else ''}@{r['username']}", f"bot:{r['id']}")] for r in rows_[page * per:(page + 1) * per]]
     nav = []
     if page > 0:
         nav.append(B("◀️", f"my:{page - 1}"))

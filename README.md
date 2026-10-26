@@ -44,6 +44,27 @@ Ichki valyuta (nomi/belgisi/kursi admin panelda; standart: Tanga 🪙, 1 ⭐ = 1
 ## Promokodlar (admin)
 Yaratish: mukofot → **nechta kod** (yoki o'z kodingiz) → har kod **necha marta** (yoki ∞) → **tugash** (kun soni / sana / ∞) → **boshlanish** (darhol / sana). Avtomatik kodlar 8 belgili: `A8BXG67H`. Ro'yxat, yoqish/o'chirish, o'chirish, `.txt` eksport. Har foydalanuvchi har kodni 1 marta ishlatadi.
 
+## Tayyor botlar (shablonlar)
+`➕ Bot yaratish` → **🆕 Bo'sh bot** yoki **📁 Kino bot**. Shablon bot yaratilganda tanlanadi va keyin o'zgarmaydi.
+
+### 📁 Kino bot
+Foydalanuvchi tomonida: kino **nomi** yoki **kodini** yozadi → bot topib yuboradi (apostrof/imlo xatosiga bardoshli qidiruv, bir nechta natija bo'lsa tugmalar). Ko'p qismli kinolarda qism tanlash tugmalari va ◀️ ▶️, `📤 Ulashish` (havola `?start=k<kod>` kinoni to'g'ridan-to'g'ri ochadi). Tayyor buyruqlar: `/top` (mashhur), `/new` (yangi), `/random` (tasodifiy). Majburiy obuna, xabar yuborish, statistika, ban, referal va boshqa umumiy imkoniyatlar odatdagidek ishlaydi. Fayl **nusxalanadi** (copy), shuning uchun «forward» belgisi, kanal nomi yoki boshqa birovning imzosi chiqmaydi; fayl ostidagi matnni egasi o'zi belgilaydi (`/admin` → 🎬 Kino bazasi → ✏️ Fayl ostidagi matn).
+
+**Baza — Telegram kanal.** `/admin` → `🎬 Kino bazasi` → `📡 Baza kanali`: botni kanalga administrator qiling (xabar yuborish/o'chirish huquqi bilan), kanalni ulang. Har bir kino kanalda shunday saqlanadi:
+```
+#tez_va_jahldor_5
+
+🎬 Tez va Jahldor 5
+🆔 Kod: 12
+```
+Sarlavhadagi **birinchi hashtag** kino nomi; bir xil hashtagli postlar — bitta kinoning qismlari. Kino qo'shish ikki yo'l bilan:
+- botda `➕ Kino qo'shish` (video/fayl yuborasiz → nom so'raladi → bot kanalga hashtag bilan joylaydi, kod beradi; mavjud nom bo'lsa yangi qism bo'ladi);
+- kanalga o'zingiz `#kino_nomi` sarlavhali video/fayl tashlasangiz — bot uni o'zi indekslaydi.
+
+**Muhim cheklov:** Telegram Bot API botga kanal tarixini qidirishga ruxsat bermaydi, shuning uchun postlar ro'yxati (xabar ID + hashtag) `builder.db` da indekslanadi (fayllarning o'zi faqat kanalda). Bot qo'shilishidan oldingi postlarni `🔁 Eski postlarni indekslash` orqali kanaldan forward qilib qo'shasiz. `builder.db` zaxirasi (`/backup`) indeksni ham saqlaydi. Kanaldan post o'chirilsa, foydalanuvchi so'raganda indeksdan ham olib tashlanadi.
+
+Admin: `📋 Kinolar` (ro'yxat, qism qo'shish, o'chirish — faqat botdan yoki kanaldan ham), `🔒 Himoya` (foydalanuvchi faylni forward/saqlay olmaydi), ko'rishlar statistikasi.
+
 ## Yangi imkoniyatlar
 - **Referal tizimi** — har foydalanuvchining shaxsiy havolasi `t.me/bot?start=ref_<id>`; yangi odam kelganda taklif qiluvchiga mukofot (admin panel → «🎁 Referal va bonus») va xabar boradi. O'zini taklif qilish, ikkinchi marta hisoblash, banlangan foydalanuvchi — bloklangan. Statistikada «eng ko'p taklif qilganlar».
 - **Kunlik bonus** — `/bonus` (har ~20 soatda 1 marta, miqdorni egasi belgilaydi).
@@ -57,6 +78,7 @@ Yaratish: mukofot → **nechta kod** (yoki o'z kodingiz) → har kod **necha mar
 - **Panel bitta xabarda ishlaydi:** yangi bo'lim ochilganda yoki qiymat so'ralganda bot yangi xabar yubormaydi — joriy xabarning o'zi tahrirlanadi, siz yuborgan javob esa chatdan o'chiriladi (xabar yuborish uchun yuborilgan xabar bundan mustasno).
 - **Ikki marta javob himoyasi:** bir xil `update_id` ikkinchi marta qayta ishlanmaydi. Agar bot **ikki joyda** (masalan, server va GitHub Actions'da) ishlayotgan bo'lsa, `Conflict` xatosi ketma-ket 3 marta takrorlanganda egasi va adminlarga ogohlantirish yuboriladi.
 - **Holat xabari (ETA):** bot ishga tushgach `ADMIN_IDS` dagi adminlarga «✅ Botingiz ishga tushdi — run bo'ldi!» xabari boradi: hodisa (rejali qayta ishga tushirish / qo'lda / kod yangilandi + commit matni va versiya), ishlagan vaqt, **keyingi yangilanishgacha qolgan vaqt (ETA, progress-bar bilan)** va voqealar ro'yxati. Shu xabarning o'zi tahrirlanib turadi (tugashga yaqinlashgan sari tez-tez: 60 → 30 → 10 soniya). Yangilanishda xabar «🔄 qayta ishga tushirish boshlandi» holatiga o'tadi, yangi seans esa yangi xabar yuboradi (eskisi «tugagan» deb belgilanadi). Adminlar asosiy botga kamida bir marta `/start` bosgan bo'lsin. `RUN_SECONDS` berilmasa (oddiy server) ETA ko'rsatilmaydi.
+- **`/top`** — balans va takliflar bo'yicha reyting. **`/contact`** — murojaat: foydalanuvchi xabari egasiga/adminlarga boradi, ular shu xabarga *reply* qilsa javob foydalanuvchiga yetadi (panel → «🎁 Referal va bonus» → «Murojaat: yoqish»). **Xush kelibsiz bonusi** — yangi foydalanuvchiga bir martalik balans. **Tugma statistikasi** — statistikada eng ko'p bosilgan inline tugmalar.
 - GitHub'da `main`/`master` ga push qilinsa, ishlayotgan bot tartibli to'xtab, yangi kod darhol ishga tushadi (`.md` fayllar bundan mustasno).
 - Eski bazalar avtomatik yangilanadi (ustunlar o'zi qo'shiladi).
 

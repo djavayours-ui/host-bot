@@ -13,7 +13,7 @@ import config
 import db
 
 log = logging.getLogger("builder.manager")
-UPDATES = ["message", "callback_query", "my_chat_member"]
+UPDATES = ["message", "callback_query", "my_chat_member", "channel_post"]
 SEEN_MAX = 2000            # har bot uchun eslab qolinadigan oxirgi update_id lar soni
 
 
